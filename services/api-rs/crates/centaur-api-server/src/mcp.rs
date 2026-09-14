@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -13,9 +13,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose};
+use centaur_sandbox_core::SandboxError;
 use centaur_session_runtime::{
-    SessionRuntime, ToolHostCallInput, ToolHostCallOutput, ToolHostCallPolicy, ToolHostInvocation,
-    ToolHostToolFilter, tool_host_thread_key,
+    SessionRuntime, SessionRuntimeError, ToolHostCallInput, ToolHostCallOutput, ToolHostCallPolicy,
+    ToolHostInvocation, ToolHostToolFilter, tool_host_thread_key,
 };
 use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
@@ -102,6 +103,14 @@ struct CentaurToolCallArguments {
     argv: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CentaurArtifactGetArguments {
+    path: String,
+}
+
+const MCP_ARTIFACT_MAX_BYTES: usize = 10 * 1024 * 1024;
+
 struct McpToolCallOutcome {
     result: Value,
     timed_out: bool,
@@ -155,7 +164,7 @@ pub(crate) async fn mcp_post(
             if mcp_v2_tool_name(&params.name) && !mcp_v2_enabled() {
                 return Ok(mcp_json_error(id, -32602, "unknown tool"));
             }
-            let tool = if mcp_v2_tool_name(&params.name) || params.name == "centaur_whoami" {
+            let tool = if mcp_builtin_tool_name(&params.name) {
                 None
             } else {
                 let policy = mcp_tool_host_call_policy(&state, &principal).await?;
@@ -221,6 +230,9 @@ async fn mcp_tool_call_result(
                 }
                 "centaur_tool_call" => {
                     mcp_v2_tool_call_result(state, principal, params.arguments).await
+                }
+                "centaur_artifact_get" => {
+                    mcp_artifact_get_result(state, principal, params.arguments).await
                 }
                 "centaur_whoami" => mcp_whoami_result(principal, params.arguments).map(|result| {
                     McpToolCallOutcome {
@@ -312,6 +324,30 @@ fn mcp_whoami_tool() -> Value {
     })
 }
 
+fn mcp_artifact_get_tool() -> Value {
+    json!({
+        "name": "centaur_artifact_get",
+        "description": concat!(
+            "Retrieve a file created by a Centaur tool in the sandbox. Pass a relative path beneath ",
+            "/tmp/downloads. Subdirectories and symlinks are allowed when the opened regular file ",
+            "resolves within that directory. Files may be no larger than 10 MiB. Returns the file ",
+            "as an embedded MCP resource."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "A relative file path within /tmp/downloads.",
+                },
+            },
+            "additionalProperties": false,
+        },
+    })
+}
+
 fn mcp_initialize_result(params: &Value) -> Value {
     let mut result = json!({
         "protocolVersion": requested_mcp_protocol_version(params),
@@ -337,7 +373,11 @@ fn mcp_initialize_result(params: &Value) -> Value {
                 "from the short MCP bootstrap tool list. In particular, search when a request ",
                 "involves an external service, private or current data, an external action, or ",
                 "a service URL. Load the selected tool with `centaur_catalog_load`, follow its ",
-                "help and skill instructions, then invoke it with `centaur_tool_call`."
+                "help and skill instructions, then invoke it with `centaur_tool_call`. When the ",
+                "user needs a downloadable artifact, instruct the producing tool to write it ",
+                "beneath `/tmp/downloads`, then immediately call `centaur_artifact_get` with its ",
+                "relative path. Files in `/tmp/downloads` are transient and may not survive a ",
+                "sandbox pause, restart, or replacement."
             )
             .to_owned(),
         );
@@ -349,6 +389,7 @@ fn mcp_builtin_tools() -> Vec<Value> {
     let mut tools = Vec::new();
     if mcp_v2_enabled() {
         tools.extend(mcp_v2_tools());
+        tools.push(mcp_artifact_get_tool());
     }
     tools.push(mcp_whoami_tool());
     tools
@@ -365,8 +406,15 @@ fn mcp_tool_entries(filter: &SandboxToolFilter) -> Result<Vec<Value>, ApiError> 
 fn mcp_v2_tool_name(name: &str) -> bool {
     matches!(
         name,
-        "centaur_catalog_search" | "centaur_catalog_load" | "centaur_tool_call"
+        "centaur_catalog_search"
+            | "centaur_catalog_load"
+            | "centaur_tool_call"
+            | "centaur_artifact_get"
     )
+}
+
+fn mcp_builtin_tool_name(name: &str) -> bool {
+    mcp_v2_tool_name(name) || matches!(name, "centaur_artifact_get" | "centaur_whoami")
 }
 
 fn mcp_v2_tools() -> Vec<Value> {
@@ -701,10 +749,7 @@ fn mcp_centaur_tool_catalog(filter: &SandboxToolFilter) -> Result<Vec<Discovered
     Ok(tools
         .into_iter()
         // Built-in names take precedence over scripts from tool sources.
-        .filter(|tool| {
-            !matches!(tool.name.as_str(), "centaur" | "centaur_whoami")
-                && !mcp_v2_tool_name(&tool.name)
-        })
+        .filter(|tool| tool.name != "centaur" && !mcp_builtin_tool_name(&tool.name))
         .filter(|tool| filter.admits(tool))
         .collect())
 }
@@ -803,6 +848,44 @@ fn mcp_whoami_result(principal: &McpPrincipal, arguments: Value) -> Result<Value
         }))?,
         false,
     ))
+}
+
+async fn mcp_artifact_get_result(
+    state: &AppState,
+    principal: &McpPrincipal,
+    arguments: Value,
+) -> Result<McpToolCallOutcome, ApiError> {
+    let args = match serde_json::from_value::<CentaurArtifactGetArguments>(arguments) {
+        Ok(args) if !args.path.trim().is_empty() => args,
+        Ok(_) => return Ok(invalid_mcp_v2_arguments("path must not be blank")),
+        Err(error) => return Ok(invalid_mcp_v2_arguments(error)),
+    };
+    record_mcp_tool_method(&Span::current(), "centaur_artifact_get", "get");
+    let output = match state
+        .runtime()?
+        .read_sandbox_artifact(&principal.principal_id, &args.path, MCP_ARTIFACT_MAX_BYTES)
+        .await
+    {
+        Ok(output) => output,
+        Err(error) => return mcp_artifact_get_error_result(error),
+    };
+    record_mcp_tool_correlation(&Span::current(), None, None, Some(&output.sandbox_id));
+    mcp_artifact_get_output_result(&args.path, output.contents)
+}
+
+fn mcp_artifact_get_error_result(
+    error: SessionRuntimeError,
+) -> Result<McpToolCallOutcome, ApiError> {
+    match error {
+        SessionRuntimeError::BadRequest(message)
+        | SessionRuntimeError::Sandbox(SandboxError::ArtifactRejected(message)) => {
+            Ok(McpToolCallOutcome {
+                result: mcp_text_result(format!("artifact retrieval failed: {message}"), true),
+                timed_out: false,
+            })
+        }
+        error => Err(error.into()),
+    }
 }
 
 async fn mcp_v1_tool_result(
@@ -1113,6 +1196,51 @@ fn mcp_v2_load_output_result(
     Ok(McpToolCallOutcome {
         result,
         timed_out: output.timed_out,
+    })
+}
+
+fn mcp_artifact_get_output_result(
+    artifact_path: &str,
+    contents: Vec<u8>,
+) -> Result<McpToolCallOutcome, ApiError> {
+    let data_base64 = general_purpose::STANDARD.encode(&contents);
+
+    let encoded_path = artifact_path
+        .split('/')
+        .map(|component| urlencoding::encode(component).into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    let uri = format!("file:///tmp/downloads/{encoded_path}");
+    let filename = Path::new(artifact_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(artifact_path);
+    let metadata = json!({
+        "path": artifact_path,
+        "filename": filename,
+        "mime_type": "application/octet-stream",
+        "size_bytes": contents.len(),
+    });
+    Ok(McpToolCallOutcome {
+        result: json!({
+            "content": [
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": uri,
+                        "mimeType": metadata["mime_type"],
+                        "blob": data_base64,
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": serde_json::to_string_pretty(&metadata)?,
+                },
+            ],
+            "structuredContent": metadata,
+            "isError": false,
+        }),
+        timed_out: false,
     })
 }
 
@@ -2070,12 +2198,22 @@ def search(query, limit=20):
                         "centaur_catalog_search",
                         "centaur_catalog_load",
                         "centaur_tool_call",
+                        "centaur_artifact_get",
                         "centaur_whoami",
                     ]
                 } else {
                     vec!["centaur_whoami"]
                 }
             );
+            let initialize = mcp_initialize_result(&json!({}));
+            if enabled {
+                let instructions = initialize["instructions"].as_str().unwrap();
+                assert!(instructions.contains("write it beneath `/tmp/downloads`"));
+                assert!(instructions.contains("`centaur_artifact_get`"));
+                assert!(instructions.contains("transient"));
+            } else {
+                assert!(initialize.get("instructions").is_none());
+            }
 
             // Invalid arguments prove enabled requests reach the dispatcher
             // without requiring a runtime. Disabled cached calls fail earlier.
@@ -2167,6 +2305,7 @@ def search(query, limit=20):
                 "centaur_catalog_search",
                 "centaur_catalog_load",
                 "centaur_tool_call",
+                "centaur_artifact_get",
                 "centaur_whoami",
             ]
         );
@@ -2367,6 +2506,62 @@ def search(query, limit=20):
         assert_eq!(
             outcome.result["structuredContent"]["help"],
             "Usage: demo [OPTIONS]\n"
+        );
+    }
+
+    #[test]
+    fn mcp_artifact_failures_return_tool_errors() {
+        for error in [
+            SessionRuntimeError::BadRequest("no MCP sandbox exists".to_owned()),
+            SessionRuntimeError::Sandbox(SandboxError::ArtifactRejected(
+                "file was not found".to_owned(),
+            )),
+        ] {
+            let outcome = mcp_artifact_get_error_result(error).unwrap();
+            assert!(mcp_result_is_error(&outcome.result));
+            assert!(
+                outcome.result["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("artifact retrieval failed:")
+            );
+        }
+        assert!(
+            mcp_artifact_get_error_result(SessionRuntimeError::Sandbox(SandboxError::io(
+                "pod exec failed"
+            )))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mcp_artifact_get_returns_an_embedded_resource() {
+        let contents = b"sandbox report\n";
+        let outcome =
+            mcp_artifact_get_output_result("reports/quarterly report.txt", contents.to_vec())
+                .unwrap();
+
+        assert!(!mcp_result_is_error(&outcome.result));
+        assert_eq!(
+            outcome.result["content"][0]["resource"]["uri"],
+            "file:///tmp/downloads/reports/quarterly%20report.txt"
+        );
+        assert_eq!(
+            outcome.result["content"][0]["resource"]["mimeType"],
+            "application/octet-stream"
+        );
+        assert_eq!(
+            outcome.result["content"][0]["resource"]["blob"],
+            general_purpose::STANDARD.encode(contents)
+        );
+        assert_eq!(
+            outcome.result["structuredContent"],
+            json!({
+                "path": "reports/quarterly report.txt",
+                "filename": "quarterly report.txt",
+                "mime_type": "application/octet-stream",
+                "size_bytes": contents.len(),
+            })
         );
     }
 
