@@ -136,6 +136,18 @@ module Console
       assert_response :unprocessable_entity
     end
 
+    test "PATCH update can disable a secret" do
+      secret = static_secrets(:github_token_inject)
+
+      patch console_static_secret_url(secret.oid), params: {
+        secret: { name: secret.name, enabled: "0" },
+        static: { mode: "inject", header: "Authorization", formatter: "Bearer {{ .Value }}" }
+      }
+
+      assert_redirected_to console_secret_path("static", secret.oid)
+      assert_not secret.reload.enabled?
+    end
+
     test "PATCH update changes attributes and replaces rules" do
       secret = static_secrets(:github_token_inject)
       patch console_static_secret_url(secret.oid), params: {
@@ -168,6 +180,60 @@ module Console
             params: { secret_refs: [ "static:#{static.oid}" ], operation: "enable" }
       assert static.reload.enabled?
       assert_not pg_dsn.reload.enabled?
+    end
+
+    test "PATCH bulk update preserves filters and page in its redirect" do
+      secret = static_secrets(:github_token_inject)
+
+      patch console_bulk_update_secrets_url,
+            params: {
+              secret_refs: [ "static:#{secret.oid}" ], operation: "disable",
+              q: "github", type: "static", page: "2"
+            }
+
+      assert_redirected_to console_secrets_path(q: "github", type: "static", page: "2")
+    end
+
+    test "PATCH bulk update rejects malformed selections" do
+      patch console_bulk_update_secrets_url,
+            params: { secret_refs: { "0" => "static:anything" }, operation: "disable" }
+
+      assert_redirected_to console_secrets_path
+      assert_equal "Invalid secret selection.", flash[:alert]
+    end
+
+    test "PATCH bulk update resolves every selection before writing" do
+      secret = static_secrets(:github_token_inject)
+
+      patch console_bulk_update_secrets_url,
+            params: { secret_refs: [ "static:#{secret.oid}", "pg_dsn:pgs_missing" ], operation: "disable" }
+
+      assert_redirected_to console_secrets_path
+      assert_equal "One or more selected secrets no longer exist.", flash[:alert]
+      assert secret.reload.enabled?
+    end
+
+    test "PATCH bulk update rejects an invalid operation" do
+      secret = static_secrets(:github_token_inject)
+
+      patch console_bulk_update_secrets_url,
+            params: { secret_refs: [ "static:#{secret.oid}" ], operation: "delete" }
+
+      assert_redirected_to console_secrets_path
+      assert_equal "Choose a valid bulk action.", flash[:alert]
+      assert secret.reload.enabled?
+    end
+
+    test "PATCH bulk update requires an admin" do
+      secret = static_secrets(:github_token_inject)
+      delete logout_url
+      post login_url, params: { email: users(:member_user).email, password: "password123456" }
+
+      patch console_bulk_update_secrets_url,
+            params: { secret_refs: [ "static:#{secret.oid}" ], operation: "disable" }
+
+      assert_redirected_to console_threads_path
+      assert secret.reload.enabled?
     end
 
     test "PATCH bulk update requires a selection" do
@@ -505,6 +571,19 @@ module Console
       grant = role.grants.find_by(static_secret: secret)
       assert_not_nil grant
       assert_equal Grant::DEFAULT_ROLE_PRIORITY, grant.priority
+    end
+
+    test "POST grant_role rejects a disabled secret" do
+      secret = static_secrets(:acme_staging_api_key)
+      role = roles(:acme_admin_role)
+      secret.update_attribute(:enabled, false)
+
+      assert_no_difference -> { role.grants.count } do
+        post console_secret_grant_role_url("static", secret.oid), params: { role_id: role.oid }
+      end
+
+      assert_redirected_to console_secret_path("static", secret.oid)
+      assert_equal "Enable this secret before assigning it to a role.", flash[:alert]
     end
 
     test "POST grant_role is idempotent" do

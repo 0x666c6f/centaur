@@ -341,6 +341,19 @@ module Api
         assert_response :bad_request
       end
 
+      test "PUT preserves enabled when omitted" do
+        ref = static_secrets(:github_token_inject)
+        ref.update_attribute(:enabled, false)
+        get api_v1_static_secret_url(id: ref.oid), headers: auth_headers
+        data = json_body.fetch("data").except("id", "enabled", "created_at", "updated_at")
+
+        put api_v1_static_secret_url(id: ref.oid), params: { data: data }.to_json, headers: auth_headers
+
+        assert_response :ok
+        assert_not ref.reload.enabled?
+        assert_equal false, json_body.dig("data", "enabled")
+      end
+
       test "PUT updates SSR fields and replaces source and rules" do
         ref = static_secrets(:github_token_inject)
         old_source = SecretSource.create!(source_type: "env", config: { "var" => "OLD" },
