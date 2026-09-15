@@ -30,7 +30,7 @@ module Console
 
         cfg[:model].find_by_oid!(id)
       end
-      ApplicationRecord.transaction { secrets.each { |secret| secret.update!(enabled: enabled) } }
+      ApplicationRecord.transaction { secrets.each { |secret| secret.update_attribute(:enabled, enabled) } }
 
       status = enabled ? "enabled" : "disabled"
       redirect_to console_secrets_path,
