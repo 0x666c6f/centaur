@@ -1,4 +1,4 @@
-class AddEnabledToOtherSecretTypes < ActiveRecord::Migration[8.1]
+class AddEnabledToSecretTypes < ActiveRecord::Migration[8.1]
   TABLES = %i[
     aws_auth_secrets
     gcp_auth_secrets
@@ -6,6 +6,7 @@ class AddEnabledToOtherSecretTypes < ActiveRecord::Migration[8.1]
     hmac_secrets
     oauth_token_secrets
     pg_dsn_secrets
+    static_secrets
   ].freeze
 
   def change
