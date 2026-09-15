@@ -22,7 +22,13 @@ class PrincipalEffectiveGrantsPageTest < ActiveSupport::TestCase
       per_page: 50
     ).call
 
-    assert_equal relations.values.sum(&:count), result.total_count
+    expected_count = principal.effective_grants
+      .includes(*Grant::GRANTABLE_ASSOCIATIONS)
+      .filter_map(&:grantable)
+      .select(&:enabled?)
+      .uniq
+      .size
+    assert_equal expected_count, result.total_count
     assert_not_includes result.records_by_kind.fetch("static"), disabled
   end
 end
