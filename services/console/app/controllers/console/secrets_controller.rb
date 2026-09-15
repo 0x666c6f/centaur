@@ -8,7 +8,34 @@ module Console
     layout "console"
 
     before_action :require_admin
-    before_action :set_secret
+    before_action :set_secret, only: %i[grant_role revoke_role_grant]
+
+    def bulk_update
+      secret_refs = Array(params[:secret_refs]).uniq
+      if secret_refs.empty?
+        return redirect_to console_secrets_path, alert: "Select at least one secret."
+      end
+
+      enabled = case params[:operation]
+      when "enable" then true
+      when "disable" then false
+      else
+        return redirect_to console_secrets_path, alert: "Choose a valid bulk action."
+      end
+
+      secrets = secret_refs.map do |ref|
+        kind, separator, id = ref.partition(":")
+        cfg = SECRET_KINDS[kind]
+        raise ActiveRecord::RecordNotFound if separator.blank? || cfg.nil?
+
+        cfg[:model].find_by_oid!(id)
+      end
+      ApplicationRecord.transaction { secrets.each { |secret| secret.update!(enabled: enabled) } }
+
+      status = enabled ? "enabled" : "disabled"
+      redirect_to console_secrets_path,
+                  notice: "#{secrets.size} #{"secret".pluralize(secrets.size)} #{status}."
+    end
 
     def grant_role
       role = Role.find_by_oid!(params[:role_id])

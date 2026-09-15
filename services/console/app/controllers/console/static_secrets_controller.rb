@@ -4,26 +4,6 @@ module Console
   class StaticSecretsController < BaseSecretsController
     include RuleParams
 
-    def bulk_update
-      secret_ids = Array(params[:secret_ids]).uniq
-      if secret_ids.empty?
-        return redirect_to console_secrets_path, alert: "Select at least one static secret."
-      end
-
-      enabled = case params[:operation]
-      when "enable" then true
-      when "disable" then false
-      else
-        return redirect_to console_secrets_path, alert: "Choose a valid bulk action."
-      end
-
-      secrets = secret_ids.map { |id| StaticSecret.find_by_oid!(id) }
-      StaticSecret.transaction { secrets.each { |secret| secret.update!(enabled: enabled) } }
-
-      status = enabled ? "enabled" : "disabled"
-      redirect_to console_secrets_path, notice: "#{secrets.size} static #{"secret".pluralize(secrets.size)} #{status}."
-    end
-
     private
 
     def model
@@ -38,7 +18,6 @@ module Console
       assign_identity(secret)
       st = params.fetch(:static, ActionController::Parameters.new)
       secret.kind = st[:kind].presence || CredentialProfiles::Registry::CUSTOM_KIND
-      secret.enabled = ActiveModel::Type::Boolean.new.cast(st[:enabled]) if st.key?(:enabled)
       if st[:mode] == "replace"
         secret.inject_config = nil
         secret.replace_config = replace_config(st)

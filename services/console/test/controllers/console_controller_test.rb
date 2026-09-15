@@ -49,10 +49,11 @@ class ConsoleControllerTest < ActionDispatch::IntegrationTest
     assert_select "body", text: /GITHUB_TOKEN/, count: 0
     assert_select "a[href=?][title=?]", console_secret_path("static", secret.oid), secret.name
     assert_select "time[datetime=?]", secret.created_at.iso8601
-    assert_select "form[action=?]", bulk_update_console_static_secrets_path do
-      assert_select "input[name='secret_ids[]']", count: StaticSecret.count
-      assert_select "button[name=operation][value=enable]", text: "Enable"
-      assert_select "button[name=operation][value=disable]", text: "Disable"
+    assert_select "form[action=?][data-controller=bulk-selection]", console_bulk_update_secrets_path do
+      assert_select "input[name='secret_refs[]']", count: SecretKinds::SECRET_KINDS.sum { |_kind, cfg| cfg[:model].count }
+      assert_select "select[name=operation] option[value=enable]", text: "Enable selected"
+      assert_select "select[name=operation] option[value=disable]", text: "Disable selected"
+      assert_select "div[data-bulk-selection-target=toolbar][hidden]"
     end
   end
 

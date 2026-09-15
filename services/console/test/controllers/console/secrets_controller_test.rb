@@ -152,29 +152,29 @@ module Console
       assert_equal [ "only.example.com" ], secret.rules.map(&:host)
     end
 
-    test "PATCH bulk update enables and disables selected static secrets" do
-      first = static_secrets(:github_token_inject)
-      second = static_secrets(:acme_prod_api_key)
+    test "PATCH bulk update manages selected secrets across types" do
+      static = static_secrets(:github_token_inject)
+      pg_dsn = pg_dsn_secrets(:acme_analytics_pg)
 
-      patch bulk_update_console_static_secrets_url,
-            params: { secret_ids: [ first.oid, second.oid ], operation: "disable" }
+      patch console_bulk_update_secrets_url,
+            params: { secret_refs: [ "static:#{static.oid}", "pg_dsn:#{pg_dsn.oid}" ], operation: "disable" }
 
       assert_redirected_to console_secrets_path
-      assert_equal "2 static secrets disabled.", flash[:notice]
-      assert_not first.reload.enabled?
-      assert_not second.reload.enabled?
+      assert_equal "2 secrets disabled.", flash[:notice]
+      assert_not static.reload.enabled?
+      assert_not pg_dsn.reload.enabled?
 
-      patch bulk_update_console_static_secrets_url,
-            params: { secret_ids: [ first.oid ], operation: "enable" }
-      assert first.reload.enabled?
-      assert_not second.reload.enabled?
+      patch console_bulk_update_secrets_url,
+            params: { secret_refs: [ "static:#{static.oid}" ], operation: "enable" }
+      assert static.reload.enabled?
+      assert_not pg_dsn.reload.enabled?
     end
 
     test "PATCH bulk update requires a selection" do
-      patch bulk_update_console_static_secrets_url, params: { operation: "disable" }
+      patch console_bulk_update_secrets_url, params: { operation: "disable" }
 
       assert_redirected_to console_secrets_path
-      assert_equal "Select at least one static secret.", flash[:alert]
+      assert_equal "Select at least one secret.", flash[:alert]
     end
 
     test "DELETE destroy removes the secret and cascades its grants" do

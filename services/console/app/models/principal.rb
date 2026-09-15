@@ -79,7 +79,7 @@ class Principal < ApplicationRecord
       .includes(*Grant::GRANTABLE_ASSOCIATIONS)
       .filter_map(&:grantable)
       .filter_map do |credential|
-        next if credential.is_a?(StaticSecret) && !credential.enabled?
+        next unless credential.enabled?
 
         label = credential.labels.to_h[TOOL_LABEL]
         label.strip if label.is_a?(String)
@@ -92,7 +92,6 @@ class Principal < ApplicationRecord
   # Static secrets this principal resolves to, via its effective grants.
   def granted_static_secrets
     granted_secrets_by_priority(StaticSecret, :static_secret_id, includes: %i[source rules])
-      .where(enabled: true)
   end
 
   # Static wrapper secrets this principal may carry into turns it starts as
@@ -391,6 +390,7 @@ class Principal < ApplicationRecord
     model
       .joins("INNER JOIN (#{priorities.to_sql}) granted_priorities " \
              "ON granted_priorities.secret_id = #{model.table_name}.id")
+      .where(model.table_name => { enabled: true })
       .select("#{model.table_name}.*", "granted_priorities.effective_priority")
       .includes(*includes)
       .order(Arel.sql("granted_priorities.effective_priority ASC, #{model.table_name}.id ASC"))

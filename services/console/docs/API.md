@@ -177,6 +177,10 @@ A rule scopes a credential to matching outbound requests. Rules appear as the `r
 
 Rules are positional: a `position` (0-based, assigned from array order) is returned in responses but is not part of the request. On update, the supplied `rules` array fully replaces the existing rules.
 
+## Secret enablement
+
+Every grantable secret type has an optional `enabled` boolean that defaults to `true`. A disabled secret retains its definition and grants and remains visible through list and detail APIs, but is not delivered to principals. Create and update responses include the effective `enabled` value.
+
 ## Static secrets
 
 A static secret injects or replaces a fixed credential value on matching requests. It has a single secret [source](#secret-sources) and a list of [rules](#request-rules), and defines exactly one of `inject_config` or `replace_config`.
@@ -188,7 +192,7 @@ A static secret injects or replaces a fixed credential value on matching request
 | `foreign_id`     | optional    | Globally unique. Immutable after create. |
 | `name`           | optional    | |
 | `description`    | optional    | |
-| `enabled`        | optional    | Boolean; defaults to `true`. Disabled secrets retain their definitions and grants but are not delivered to principals. |
+| `enabled`        | optional    | Boolean; defaults to `true`. See [Secret enablement](#secret-enablement). |
 | `labels`         | optional    | Object; defaults to `{}`. |
 | `inject_config`  | conditional | Define exactly one of `inject_config` / `replace_config`. |
 | `replace_config` | conditional | |
