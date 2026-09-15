@@ -124,12 +124,12 @@ def search(
     """Search messages in bot-accessible channels.
 
     Workspace-wide queries use Slack's native search API. Queries with --channels
-    scan authorized channel history through the Centaur API server proxy and rank
+    scan proxy-accessible public or explicitly granted channel history and rank
     results by relevance (exact phrase matches score higher).
 
     Native search uses the linked Slack user's token. If the principal has no
     linked Slack account, search falls back to bot-accessible channel history.
-    Scoped history searches are limited to authorized channels.
+    Scoped history searches are limited to proxy-accessible channels.
 
     Examples:
         slack search "deploy"
@@ -602,19 +602,11 @@ def _render_channels(results: list[dict], title: str, include_access: bool = Fal
 def channels(
     limit: int = typer.Option(100, "--limit", "-n", help="Max channels"),
     query: str = typer.Option(None, "--query", "-q", help="Filter by name"),
-    bot_member_only: bool = typer.Option(
-        False,
-        "--bot-member-only",
-        help="Only list JWT-authorized channels with history access",
-    ),
 ):
-    """List Slack channels authorized by the Centaur API server proxy JWT."""
+    """List bot-readable public and explicitly granted channels from the proxy."""
     from .client import list_channels_proxy
 
-    results = list_channels_proxy(limit=limit, history_only=bot_member_only)
-
-    if query:
-        results = [c for c in results if query.lower() in c["name"].lower()]
+    results = list_channels_proxy(limit=limit, query=query)
 
     _render_channels(results, f"Channels ({len(results)})", include_access=True)
 
