@@ -37,7 +37,7 @@ class PrincipalEffectiveGrantsPage
   end
 
   def effective_secret_counts
-    relations.transform_values(&:count)
+    relations.transform_values { |relation| relation.count(:all) }
   end
 
   def page_records(counts, offset:)
