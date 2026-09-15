@@ -49,6 +49,11 @@ class ConsoleControllerTest < ActionDispatch::IntegrationTest
     assert_select "body", text: /GITHUB_TOKEN/, count: 0
     assert_select "a[href=?][title=?]", console_secret_path("static", secret.oid), secret.name
     assert_select "time[datetime=?]", secret.created_at.iso8601
+    assert_select "form[action=?]", bulk_update_console_static_secrets_path do
+      assert_select "input[name='secret_ids[]']", count: StaticSecret.count
+      assert_select "button[name=operation][value=enable]", text: "Enable"
+      assert_select "button[name=operation][value=disable]", text: "Disable"
+    end
   end
 
   test "secrets table filters by type and searches by name" do

@@ -8,6 +8,16 @@
     <%= render "identity_fields", secret: secret %>
 
     <section class="form-section">
+      <h2 class="form-section-heading">Availability</h2>
+      <%= hidden_field_tag "static[enabled]", "0" %>
+      <label class="flex cursor-pointer items-center gap-2 text-sm text-zinc-300">
+        <%= check_box_tag "static[enabled]", "1", secret.enabled? %>
+        <span>Enabled for granted principals</span>
+      </label>
+      <p class="form-hint">Disable this secret to stop delivering it without removing its definition or grants.</p>
+    </section>
+
+    <section class="form-section">
       <h2 class="form-section-heading">Credential profile</h2>
       <%= select_tag "static[kind]",
                      options_for_select([ [ "Custom", "custom" ], [ "GitHub token", "github_token" ] ], secret.kind),

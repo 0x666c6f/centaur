@@ -188,6 +188,7 @@ A static secret injects or replaces a fixed credential value on matching request
 | `foreign_id`     | optional    | Globally unique. Immutable after create. |
 | `name`           | optional    | |
 | `description`    | optional    | |
+| `enabled`        | optional    | Boolean; defaults to `true`. Disabled secrets retain their definitions and grants but are not delivered to principals. |
 | `labels`         | optional    | Object; defaults to `{}`. |
 | `inject_config`  | conditional | Define exactly one of `inject_config` / `replace_config`. |
 | `replace_config` | conditional | |
@@ -229,6 +230,7 @@ Both config objects reject unknown keys.
     "foreign_id": "github-token",
     "name": "GitHub Token",
     "description": "Repo access",
+    "enabled": true,
     "labels": { "team": "platform" },
     "inject_config": { "header": "Authorization", "formatter": "Bearer {{ .Value }}" },
     "source": { "source_type": "env", "config": { "var": "GITHUB_TOKEN" } },
@@ -248,6 +250,7 @@ Returns `201` with the created resource. Response shape:
     "foreign_id": "github-token",
     "name": "GitHub Token",
     "description": "Repo access",
+    "enabled": true,
     "labels": { "team": "platform" },
     "inject_config": { "header": "Authorization", "formatter": "Bearer {{ .Value }}" },
     "replace_config": null,
