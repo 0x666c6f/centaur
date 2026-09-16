@@ -1441,7 +1441,7 @@ Returns `201`. The plaintext `token` is included **only** in this create respons
 
 ## Scheduled Tasks
 
-Tasks run one agent prompt and deliver the result to Slack. A task may have a five-field cron schedule in Pacific Time or omit `cron_expression` for manual-only use. Task IDs use the `tsk_` prefix. The `delivery_channel` can be a Slack channel ID available to the task author, or the special value `dm`, which resolves to the linked user's Slack direct message when the task is created or updated.
+Tasks run one agent prompt and deliver the result to Slack. A task may have a five-field cron schedule in Pacific Time; omitting `cron_expression` or sending `null` or an empty string makes it manual-only. Task IDs use the `tsk_` prefix. The `delivery_channel` can be a Slack channel ID available to the task author, or the special value `dm`, which resolves to the linked user's Slack direct message when the task is created or updated.
 
 These endpoints use the sandbox entitlement JWT injected by `iron-proxy`. Every operation requires an active Console user linked to the sandbox principal and is scoped to tasks owned by that user. A task owned by another user returns `404`.
 
@@ -1450,7 +1450,7 @@ These endpoints use the sandbox entitlement JWT injected by `iron-proxy`. Every 
 | `GET` | `/api/v1/sandbox/scheduled_tasks` | List the linked user's tasks. |
 | `GET` | `/api/v1/sandbox/scheduled_tasks/:id` | Read one owned task by `tsk_...` OID. |
 | `POST` | `/api/v1/sandbox/scheduled_tasks` | Create a task from `data.name`, `data.prompt`, `data.delivery_channel`, and optional `data.cron_expression` and `data.enabled`. |
-| `PUT`/`PATCH` | `/api/v1/sandbox/scheduled_tasks/:id` | Update any supplied task fields. Set `data.cron_expression` to `null` to make the task manual-only. |
+| `PUT`/`PATCH` | `/api/v1/sandbox/scheduled_tasks/:id` | Update any supplied task fields. Set `data.cron_expression` to `null` or an empty string to make the task manual-only. |
 | `DELETE` | `/api/v1/sandbox/scheduled_tasks/:id` | Delete an owned task. Returns `204`. |
 | `POST` | `/api/v1/sandbox/scheduled_tasks/:id/run` | Queue an immediate run. Returns `202`; disabled tasks return `422`. |
 

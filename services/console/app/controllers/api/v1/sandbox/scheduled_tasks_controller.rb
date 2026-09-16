@@ -78,10 +78,6 @@ module Api
           if attributes[:delivery_channel].to_s.strip.casecmp?("dm")
             attributes[:delivery_channel] = SlackDeliveryPolicy.new(task_author).direct_message_user_id
           end
-          if attributes.key?(:cron_expression) && attributes[:cron_expression].is_a?(String) &&
-              attributes[:cron_expression].strip.empty?
-            attributes[:cron_expression] = "invalid cron schedule"
-          end
           attributes
         end
 

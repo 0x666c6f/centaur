@@ -127,16 +127,16 @@ class Api::V1::SandboxScheduledTasksControllerTest < ActionDispatch::Integration
     assert_response :not_found
   end
 
-  test "blank cron input is invalid rather than manual-only" do
-    assert_no_difference("ScheduledTask.count") do
+  test "empty cron input creates a manual-only task" do
+    assert_difference("ScheduledTask.count", 1) do
       with_token(@proxy) do |headers|
         post "/api/v1/sandbox/scheduled_tasks",
              params: {
                data: {
-                 name: "Blank schedule",
+                 name: "Manual task",
                  prompt: "Do something.",
                  delivery_channel: "dm",
-                 cron_expression: "  "
+                 cron_expression: ""
                }
              },
              headers: headers,
@@ -144,8 +144,10 @@ class Api::V1::SandboxScheduledTasksControllerTest < ActionDispatch::Integration
       end
     end
 
-    assert_response :unprocessable_entity
-    assert_includes json_body.dig("error", "details", "cron_expression"), "is not a valid cron schedule"
+    assert_response :created
+    assert_nil json_body.dig("data", "cron_expression")
+    assert_nil json_body.dig("data", "next_run_at")
+    assert_equal "Manual only", json_body.dig("data", "schedule_label")
   end
 
   test "invalid task attributes return validation details" do
