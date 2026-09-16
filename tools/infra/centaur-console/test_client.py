@@ -172,26 +172,17 @@ def test_update_scheduled_task_patches_only_provided_fields():
     assert result["enabled"] is False
 
 
-def test_update_scheduled_task_clears_the_schedule_explicitly():
+def test_update_scheduled_task_clears_the_schedule_with_an_empty_cron():
     def handler(request: httpx.Request) -> httpx.Response:
-        assert json.loads(request.content) == {"data": {"cron_expression": None}}
+        assert json.loads(request.content) == {"data": {"cron_expression": ""}}
         return json_response({"data": {"id": "tsk_123", "cron_expression": None}})
 
     result = make_client(handler).update_scheduled_task(
         "tsk_123",
-        clear_schedule=True,
+        cron_expression="",
     )
 
     assert result["cron_expression"] is None
-
-
-def test_update_scheduled_task_rejects_schedule_and_clear_together():
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        make_client(lambda _request: json_response({})).update_scheduled_task(
-            "tsk_123",
-            cron_expression="0 9 * * *",
-            clear_schedule=True,
-        )
 
 
 def test_update_scheduled_task_requires_a_field():

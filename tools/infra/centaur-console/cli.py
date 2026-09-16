@@ -134,9 +134,8 @@ def update_scheduled_task(
     cron_expression: str | None = typer.Option(
         None,
         "--cron",
-        help="New five-field cron expression in Pacific Time",
+        help='New five-field cron expression in Pacific Time; pass "" to clear',
     ),
-    manual: bool = typer.Option(False, "--manual", help="Remove the recurring schedule"),
     delivery_channel: str | None = typer.Option(
         None,
         "--delivery-channel",
@@ -152,11 +151,7 @@ def update_scheduled_task(
     ),
 ) -> None:
     """Update selected fields on a scheduled task."""
-    if manual and cron_expression is not None:
-        raise typer.BadParameter("--manual and --cron are mutually exclusive")
-    if not manual and all(
-        value is None for value in (name, prompt, cron_expression, delivery_channel, enabled)
-    ):
+    if all(value is None for value in (name, prompt, cron_expression, delivery_channel, enabled)):
         raise typer.BadParameter("provide at least one task field to update")
 
     with get_client(url=url, bearer_token=bearer_token) as client:
@@ -167,7 +162,6 @@ def update_scheduled_task(
             cron_expression=cron_expression,
             delivery_channel=delivery_channel,
             enabled=enabled,
-            clear_schedule=manual,
         )
     console.print_json(json.dumps({"data": result}, default=str))
 
