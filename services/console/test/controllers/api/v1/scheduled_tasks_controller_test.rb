@@ -21,8 +21,14 @@ module Api
         @path = "/api/v1/scheduled_tasks/#{@task.oid}"
       end
 
-      test "returns current task execution state without task content" do
-        get @path, headers: auth_headers
+      test "returns current task execution state without task content or writes" do
+        principal = @task.execution_principal
+
+        assert_no_difference -> { Principal.count } do
+          assert_no_changes -> { principal.reload.updated_at } do
+            get @path, headers: auth_headers
+          end
+        end
 
         assert_response :ok
         assert_equal "no-store", response.headers["Cache-Control"]
@@ -31,13 +37,22 @@ module Api
             "id" => @task.oid,
             "enabled" => true,
             "author_active" => true,
-            "principal" => @task.execution_principal.foreign_id,
+            "principal" => principal.foreign_id,
             "delivery_channel" => "C0123456789",
             "delivery_allowed" => true
           },
           response.parsed_body.fetch("data")
         )
         assert_not_includes response.body, @task.prompt
+      end
+
+      test "returns no principal without provisioning one" do
+        assert_no_difference -> { Principal.count } do
+          get @path, headers: auth_headers
+        end
+
+        assert_response :ok
+        assert_nil response.parsed_body.dig("data", "principal")
       end
 
       test "returns current disabled author and delivery state" do

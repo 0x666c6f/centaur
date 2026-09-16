@@ -4,6 +4,8 @@ import asyncio
 
 from workflows import console_workflow
 
+ELIGIBILITY_STEPS = ["execution_eligibility", "delivery_eligibility"]
+
 
 class FakeContext:
     run_id = "run-123"
@@ -107,12 +109,16 @@ def test_handler_runs_one_scoped_agent_turn_and_delivers_its_text():
         f"{console_workflow.SLACK_MRKDWN_INSTRUCTIONS}"
     )
     assert kwargs["principal"] == "console-user-author"
+    assert kwargs["message_id"] == "absurd-workflow:task-456:1:user"
+    assert kwargs["idempotency_key"] == (
+        "absurd-workflow-agent-turn:absurd-workflow:task-456:1:user"
+    )
     assert "thread_key" not in kwargs
     assert kwargs["metadata"] == {
         "scheduled_task_id": "tsk_123",
         "scheduled_task_name": "Incident summary",
     }
-    assert context.step_calls == ["post_result"]
+    assert context.step_calls == ELIGIBILITY_STEPS + ["post_result"]
     assert context.slack_calls == [
         (
             "C0123456789",
@@ -147,6 +153,7 @@ def test_handler_skips_an_ineligible_task_before_starting_an_agent():
         "scheduled_task_id": "tsk_123",
     }
     assert context.agent_calls == []
+    assert context.step_calls == ["execution_eligibility"]
     assert context.slack_calls == []
 
 
@@ -176,6 +183,7 @@ def test_handler_rechecks_eligibility_before_slack_delivery():
     assert result["status"] == "skipped"
     assert result["reason"] == "scheduled_task_not_executable"
     assert len(context.agent_calls) == 1
+    assert context.step_calls == ELIGIBILITY_STEPS
     assert context.slack_calls == []
 
 
@@ -229,7 +237,7 @@ def test_handler_threads_and_truncates_long_channel_results():
         + console_workflow.SLACK_MESSAGE_CHUNK_MAX_LENGTH
         - 1
     ) // console_workflow.SLACK_MESSAGE_CHUNK_MAX_LENGTH
-    assert context.step_calls == ["post_result"] + [
+    assert context.step_calls == ELIGIBILITY_STEPS + ["post_result"] + [
         f"post_result_reply_{index}" for index in range(1, expected_chunks)
     ]
     assert len(context.slack_calls) == expected_chunks
@@ -273,7 +281,7 @@ def test_handler_posts_long_dm_results_as_replies_to_the_first_message():
 
     result = asyncio.run(console_workflow.handler(params, context))
 
-    assert context.step_calls == [
+    assert context.step_calls == ELIGIBILITY_STEPS + [
         "post_result",
         "post_result_reply_1",
         "post_result_reply_2",
@@ -310,11 +318,10 @@ def test_handler_posts_long_dm_results_as_replies_to_the_first_message():
 
     asyncio.run(console_workflow.handler(params, context))
 
-    assert context.step_calls == [
-        "post_result",
-        "post_result_reply_1",
-        "post_result_reply_2",
-    ] * 2
+    assert context.step_calls == (
+        ELIGIBILITY_STEPS
+        + ["post_result", "post_result_reply_1", "post_result_reply_2"]
+    ) * 2
     assert len(context.slack_calls) == 3
 
 
@@ -367,9 +374,11 @@ def test_handler_does_not_repeat_checkpointed_slack_posts():
     }
 
     asyncio.run(console_workflow.handler(params, context))
+    context.scheduled_tasks = [None, None]
     asyncio.run(console_workflow.handler(params, context))
 
-    assert context.step_calls == ["post_result", "post_result"]
+    assert context.scheduled_task_calls == ["tsk_123", "tsk_123"]
+    assert context.step_calls == (ELIGIBILITY_STEPS + ["post_result"]) * 2
     assert context.slack_calls == [
         (
             "C0123456789",

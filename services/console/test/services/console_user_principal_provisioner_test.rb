@@ -10,6 +10,7 @@ class ConsoleUserPrincipalProvisionerTest < ActiveSupport::TestCase
     same_principal = ConsoleUserPrincipalProvisioner.call(user)
 
     assert_equal @principal, same_principal
+    assert_equal @principal.foreign_id, ConsoleUserPrincipalProvisioner.foreign_id_for(user)
     assert_equal "console_user", @principal.kind
     assert_equal user, @principal.console_user
     assert_equal "centaur", @principal.labels["managed-by"]

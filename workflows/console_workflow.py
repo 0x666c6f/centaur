@@ -155,6 +155,22 @@ def _task_is_executable(
     )
 
 
+async def _task_is_executable_now(
+    ctx: Any,
+    *,
+    task_id: str,
+    principal: str,
+    channel: str,
+) -> bool:
+    task = await ctx.get_scheduled_task(task_id)
+    return _task_is_executable(
+        task,
+        task_id=task_id,
+        principal=principal,
+        channel=channel,
+    )
+
+
 async def handler(params: Any, ctx: Any) -> dict[str, Any]:
     prompt = _required_string(params, "prompt")
     principal = _required_string(params, "principal")
@@ -162,22 +178,28 @@ async def handler(params: Any, ctx: Any) -> dict[str, Any]:
     scheduled_task_id = _required_string(params, "scheduled_task_id")
     slack_user_id = str(params.get("slack_user_id") or "").strip()
 
-    task = await ctx.get_scheduled_task(scheduled_task_id)
-    if not _task_is_executable(
-        task,
-        task_id=scheduled_task_id,
-        principal=principal,
-        channel=channel,
-    ):
+    execution_eligible = await ctx.step(
+        "execution_eligibility",
+        lambda: _task_is_executable_now(
+            ctx,
+            task_id=scheduled_task_id,
+            principal=principal,
+            channel=channel,
+        ),
+    )
+    if not execution_eligible:
         return {
             "status": "skipped",
             "reason": "scheduled_task_not_executable",
             "scheduled_task_id": scheduled_task_id,
         }
 
+    message_id = f"absurd-workflow:{ctx.task_id}:1:user"
     result = await ctx.agent_turn(
         _prompt_for_slack(prompt),
         principal=principal,
+        message_id=message_id,
+        idempotency_key=f"absurd-workflow-agent-turn:{message_id}",
         metadata={
             "scheduled_task_id": scheduled_task_id,
             "scheduled_task_name": str(params.get("scheduled_task_name") or ""),
@@ -187,13 +209,16 @@ async def handler(params: Any, ctx: Any) -> dict[str, Any]:
     if not response_text:
         response_text = "The task completed without a text response."
 
-    task = await ctx.get_scheduled_task(scheduled_task_id)
-    if not _task_is_executable(
-        task,
-        task_id=scheduled_task_id,
-        principal=principal,
-        channel=channel,
-    ):
+    delivery_eligible = await ctx.step(
+        "delivery_eligibility",
+        lambda: _task_is_executable_now(
+            ctx,
+            task_id=scheduled_task_id,
+            principal=principal,
+            channel=channel,
+        ),
+    )
+    if not delivery_eligible:
         return {
             "status": "skipped",
             "reason": "scheduled_task_not_executable",

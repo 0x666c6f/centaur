@@ -93,7 +93,7 @@ pub struct ScheduledTask {
     pub id: String,
     pub enabled: bool,
     pub author_active: bool,
-    pub principal: String,
+    pub principal: Option<String>,
     pub delivery_channel: String,
     pub delivery_allowed: bool,
 }

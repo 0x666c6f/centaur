@@ -664,6 +664,7 @@ mod tests {
         let task = client.get_scheduled_task("tsk_123").await.unwrap().unwrap();
         assert_eq!(task.id, "tsk_123");
         assert!(task.enabled);
+        assert_eq!(task.principal.as_deref(), Some("console-user-author"));
         assert!(
             client
                 .get_scheduled_task("tsk_123")
