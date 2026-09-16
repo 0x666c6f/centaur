@@ -725,6 +725,23 @@ struct SandboxArgs {
         env = "SESSION_SANDBOX_NODE_SELECTOR"
     )]
     node_selector_json: Option<String>,
+    /// Extra metadata annotations for sandbox **and** iron-proxy pods, as a
+    /// JSON object of string key/value pairs. The chart renders
+    /// `sandbox.podAnnotations` into this. Like the node selector, these reach
+    /// the pods through the control plane rather than the chart, because api-rs
+    /// creates those pods at runtime and nothing the chart renders can reach
+    /// them.
+    ///
+    /// The motivating case is `karpenter.sh/do-not-disrupt: "true"` (or the
+    /// cluster-autoscaler equivalent) so a node consolidation or drift
+    /// replacement does not evict a pod while it is serving a turn. Malformed
+    /// input is a hard error for the same reason as the node selector: silently
+    /// dropping the annotation would leave in-flight turns evictable.
+    #[arg(
+        long = "session-sandbox-pod-annotations",
+        env = "SESSION_SANDBOX_POD_ANNOTATIONS"
+    )]
+    pod_annotations_json: Option<String>,
     /// Sandbox/proxy pod tolerations as a JSON array in the Kubernetes
     /// toleration shape. The chart renders `sandbox.tolerations` into this.
     #[arg(
@@ -1214,6 +1231,39 @@ impl SandboxArgs {
         })
     }
 
+    /// `SESSION_SANDBOX_POD_ANNOTATIONS` parsed as a JSON object of annotation
+    /// key/value pairs. Keys must be valid Kubernetes annotation keys, and
+    /// values are bounded and free of control characters, so a rejected
+    /// annotation fails startup here rather than when the API server later
+    /// rejects the pod. Invalid input fails startup for the same reason as
+    /// [`Self::node_selector`]: a silently dropped `karpenter.sh/do-not-disrupt`
+    /// would leave in-flight turns evictable.
+    fn pod_annotations(&self) -> Result<BTreeMap<String, String>, ServerError> {
+        let Some(raw) = self
+            .pod_annotations_json
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        else {
+            return Ok(BTreeMap::new());
+        };
+        let annotations =
+            serde_json::from_str::<BTreeMap<String, String>>(raw).map_err(|error| {
+                ServerError::UnsupportedConfig(format!(
+                    "SESSION_SANDBOX_POD_ANNOTATIONS must be a JSON object of string \
+                     key/value pairs: {error}"
+                ))
+            })?;
+        for (key, value) in &annotations {
+            validate_annotation(key, value).map_err(|reason| {
+                ServerError::UnsupportedConfig(format!(
+                    "SESSION_SANDBOX_POD_ANNOTATIONS entry {key:?} is invalid: {reason}"
+                ))
+            })?;
+        }
+        Ok(annotations)
+    }
+
     /// `SESSION_SANDBOX_TOLERATIONS` parsed as a JSON array of Kubernetes
     /// tolerations. Invalid input fails startup for the same reason as
     /// [`Self::node_selector`].
@@ -1539,6 +1589,48 @@ impl ToolDiscoveryArgs {
     }
 }
 
+/// Kubernetes annotation shape check: `[prefix/]name`, where the optional
+/// prefix is a lowercase DNS subdomain (<= 253 chars) and the name is <= 63
+/// chars of `[A-Za-z0-9._-]` starting and ending alphanumeric. Annotation
+/// values have no per-key length limit in Kubernetes (only a 256 KiB total),
+/// so cap each value and forbid control characters, which the API server
+/// rejects anyway.
+fn validate_annotation(key: &str, value: &str) -> Result<(), String> {
+    const MAX_VALUE_LEN: usize = 4096;
+    let (prefix, name) = match key.rsplit_once('/') {
+        Some((prefix, name)) => (Some(prefix), name),
+        None => (None, key),
+    };
+    let name_char_ok = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
+    let alnum_ends = |s: &str| {
+        s.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && s.ends_with(|c: char| c.is_ascii_alphanumeric())
+    };
+    if name.is_empty() || name.len() > 63 || !name.chars().all(name_char_ok) || !alnum_ends(name) {
+        return Err("name must be 1-63 chars of [A-Za-z0-9._-], alphanumeric at both ends".into());
+    }
+    if let Some(prefix) = prefix {
+        let label_ok = |label: &str| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                && alnum_ends(label)
+        };
+        if prefix.len() > 253 || !prefix.split('.').all(label_ok) {
+            return Err("prefix must be a lowercase DNS subdomain of at most 253 chars".into());
+        }
+    }
+    if value.len() > MAX_VALUE_LEN {
+        return Err(format!("value exceeds {MAX_VALUE_LEN} bytes"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err("value contains control characters".into());
+    }
+    Ok(())
+}
+
 impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
     type Error = ServerError;
 
@@ -1554,6 +1646,7 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
             .map(str::to_owned)
             .collect();
         config.node_selector = args.node_selector()?;
+        config.annotations = args.pod_annotations()?;
         config.tolerations = args.tolerations()?;
         config.runtime_class_name = args
             .runtime_class_name
@@ -3036,12 +3129,21 @@ mod tests {
             "centaur-sandbox",
             "--session-sandbox-priority-class-name",
             "centaur-sandbox",
+            "--session-sandbox-pod-annotations",
+            r#"{"karpenter.sh/do-not-disrupt":"true"}"#,
         ])
         .unwrap();
 
         assert_eq!(
             args.sandbox.node_selector().unwrap().get("workload"),
             Some(&"centaur-sandbox".to_owned())
+        );
+        assert_eq!(
+            args.sandbox
+                .pod_annotations()
+                .unwrap()
+                .get("karpenter.sh/do-not-disrupt"),
+            Some(&"true".to_owned())
         );
         assert_eq!(args.sandbox.tolerations().unwrap().len(), 1);
         assert_eq!(args.sandbox.runtime_class_name.as_deref(), Some("gvisor"));
@@ -3065,6 +3167,7 @@ mod tests {
         .unwrap();
 
         assert!(args.sandbox.node_selector().unwrap().is_empty());
+        assert!(args.sandbox.pod_annotations().unwrap().is_empty());
         assert!(args.sandbox.tolerations().unwrap().is_empty());
         assert!(args.sandbox.service_account_name.is_none());
         assert!(args.sandbox.priority_class_name.is_none());
@@ -3094,6 +3197,45 @@ mod tests {
         ])
         .unwrap();
         assert!(args.sandbox.tolerations().is_err());
+    }
+
+    /// A dropped `karpenter.sh/do-not-disrupt` would leave in-flight turns
+    /// evictable, so malformed pod annotations fail startup like the node
+    /// selector does, and each key/value is checked against the Kubernetes
+    /// annotation shape rather than deferred to the API server.
+    #[test]
+    fn pod_annotations_are_validated_like_kubernetes() {
+        let parse = |raw: &str| {
+            Args::try_parse_from([
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+                "--session-sandbox-pod-annotations",
+                raw,
+            ])
+            .unwrap()
+            .sandbox
+            .pod_annotations()
+        };
+
+        assert!(parse("not-json").is_err());
+        assert!(parse(r#"["karpenter.sh/do-not-disrupt"]"#).is_err());
+        assert!(parse(r#"{"karpenter.sh/do-not-disrupt": true}"#).is_err());
+        assert!(parse(r#"{"": "x"}"#).is_err());
+        assert!(parse(r#"{"bad key": "x"}"#).is_err());
+        assert!(parse(r#"{"-leading": "x"}"#).is_err());
+        assert!(parse(r#"{"bad_prefix_/name": "x"}"#).is_err());
+        assert!(parse(r#"{"Karpenter.sh/do-not-disrupt": "true"}"#).is_err());
+        assert!(parse(&format!("{{\"{}\": \"x\"}}", "a".repeat(64))).is_err());
+        assert!(parse("{\"k\": \"line\nbreak\"}").is_err());
+        assert!(parse(&format!("{{\"k\": \"{}\"}}", "v".repeat(4097))).is_err());
+
+        assert!(parse("").unwrap().is_empty());
+        assert!(parse("{}").unwrap().is_empty());
+        let ok =
+            parse(r#"{"karpenter.sh/do-not-disrupt":"true","team":"","a.b_c-d":"v w"}"#).unwrap();
+        assert_eq!(ok.len(), 3);
+        assert_eq!(ok["karpenter.sh/do-not-disrupt"], "true");
     }
 
     /// The only test that mutates the process-level OTLP env keys: keeps all

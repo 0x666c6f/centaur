@@ -1646,8 +1646,21 @@ mod tests {
         }];
         config.runtime_class_name = Some("gvisor".to_owned());
         config.priority_class_name = Some("centaur-sandbox".to_owned());
+        config.annotations =
+            BTreeMap::from([("karpenter.sh/do-not-disrupt".to_owned(), "true".to_owned())]);
 
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        assert_eq!(
+            sandbox
+                .spec
+                .pod_template
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.annotations.as_ref())
+                .and_then(|annotations| annotations.get("karpenter.sh/do-not-disrupt"))
+                .map(String::as_str),
+            Some("true")
+        );
         let pod_spec = &sandbox.spec.pod_template.spec;
 
         assert_eq!(

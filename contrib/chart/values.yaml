@@ -338,6 +338,13 @@ sandbox:
   # placement to the default scheduler.
   nodeSelector: {}
   #   workload: centaur-sandbox
+  # Extra metadata annotations for sandbox **and** iron-proxy pods, as string
+  # key/value pairs. The motivating case is keeping a cluster autoscaler from
+  # reclaiming a node while a pod is serving a turn, e.g.
+  # `karpenter.sh/do-not-disrupt: "true"` (or the cluster-autoscaler
+  # `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"`). Empty adds none.
+  podAnnotations: {}
+  #   karpenter.sh/do-not-disrupt: "true"
   tolerations: []
   # - key: centaur.ai/sandbox
   #   operator: Exists
