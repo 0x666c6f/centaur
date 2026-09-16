@@ -386,7 +386,7 @@ impl AgentSandboxBackend {
                     resolved,
                     &sync,
                     ProxyPodScheduling {
-                        annotations: &self.config.annotations,
+                        annotations: &self.config.pod_annotations,
                         node_selector: &self.config.node_selector,
                         tolerations: &self.config.tolerations,
                         runtime_class_name: self.config.runtime_class_name.as_deref(),
@@ -2762,8 +2762,13 @@ mod tests {
             config_hash: None,
         };
         let node_selector = BTreeMap::from([("workload".to_owned(), "centaur-sandbox".to_owned())]);
-        let annotations =
-            BTreeMap::from([("karpenter.sh/do-not-disrupt".to_owned(), "true".to_owned())]);
+        let annotations = BTreeMap::from([
+            ("karpenter.sh/do-not-disrupt".to_owned(), "true".to_owned()),
+            (
+                IRON_CONTROL_PROXY_ID_ANNOTATION.to_owned(),
+                "operator-value".to_owned(),
+            ),
+        ]);
         let tolerations = vec![Toleration {
             key: Some("example.com/sandbox".to_owned()),
             operator: Some("Exists".to_owned()),
