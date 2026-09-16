@@ -4,7 +4,7 @@ import asyncio
 
 from workflows import console_workflow
 
-ELIGIBILITY_STEPS = ["execution_eligibility", "delivery_eligibility"]
+ACTION_STEPS = ["agent_result", "post_result"]
 
 
 class FakeContext:
@@ -83,6 +83,14 @@ def scheduled_task_blocks(body: str, footer: str):
     return blocks
 
 
+def slack_args(index: int, **kwargs):
+    return {
+        "mrkdwn": True,
+        "client_msg_id": f"task-456:slack:{3 + (3 * index)}",
+        **kwargs,
+    }
+
+
 def test_handler_runs_one_scoped_agent_turn_and_delivers_its_text():
     context = FakeContext()
     footer = "Sent by <@U0123456789>'s scheduled task"
@@ -118,15 +126,15 @@ def test_handler_runs_one_scoped_agent_turn_and_delivers_its_text():
         "scheduled_task_id": "tsk_123",
         "scheduled_task_name": "Incident summary",
     }
-    assert context.step_calls == ELIGIBILITY_STEPS + ["post_result"]
+    assert context.step_calls == ACTION_STEPS
     assert context.slack_calls == [
         (
             "C0123456789",
             f"Daily summary\n\n{footer}",
-            {
-                "mrkdwn": True,
-                "blocks": scheduled_task_blocks("Daily summary", footer),
-            },
+            slack_args(
+                0,
+                blocks=scheduled_task_blocks("Daily summary", footer),
+            ),
         )
     ]
     assert result["delivery"]["ts"] == "123.1"
@@ -153,7 +161,7 @@ def test_handler_skips_an_ineligible_task_before_starting_an_agent():
         "scheduled_task_id": "tsk_123",
     }
     assert context.agent_calls == []
-    assert context.step_calls == ["execution_eligibility"]
+    assert context.step_calls == ["agent_result"]
     assert context.slack_calls == []
 
 
@@ -183,7 +191,7 @@ def test_handler_rechecks_eligibility_before_slack_delivery():
     assert result["status"] == "skipped"
     assert result["reason"] == "scheduled_task_not_executable"
     assert len(context.agent_calls) == 1
-    assert context.step_calls == ELIGIBILITY_STEPS
+    assert context.step_calls == ACTION_STEPS
     assert context.slack_calls == []
 
 
@@ -237,7 +245,7 @@ def test_handler_threads_and_truncates_long_channel_results():
         + console_workflow.SLACK_MESSAGE_CHUNK_MAX_LENGTH
         - 1
     ) // console_workflow.SLACK_MESSAGE_CHUNK_MAX_LENGTH
-    assert context.step_calls == ELIGIBILITY_STEPS + ["post_result"] + [
+    assert context.step_calls == ACTION_STEPS + [
         f"post_result_reply_{index}" for index in range(1, expected_chunks)
     ]
     assert len(context.slack_calls) == expected_chunks
@@ -250,17 +258,17 @@ def test_handler_threads_and_truncates_long_channel_results():
         len(call[1]) <= console_workflow.SLACK_MESSAGE_CHUNK_MAX_LENGTH
         for call in context.slack_calls
     )
-    assert context.slack_calls[0][2] == {"mrkdwn": True}
+    assert context.slack_calls[0][2] == slack_args(0)
     assert all(
-        call[2] == {"mrkdwn": True, "thread_ts": "123.1"}
-        for call in context.slack_calls[1:-1]
+        call[2] == slack_args(index, thread_ts="123.1")
+        for index, call in enumerate(context.slack_calls[1:-1], start=1)
     )
     final_body = context.slack_calls[-1][1].removesuffix(f"\n\n{footer}")
-    assert context.slack_calls[-1][2] == {
-        "thread_ts": "123.1",
-        "mrkdwn": True,
-        "blocks": scheduled_task_blocks(final_body, footer),
-    }
+    assert context.slack_calls[-1][2] == slack_args(
+        expected_chunks - 1,
+        thread_ts="123.1",
+        blocks=scheduled_task_blocks(final_body, footer),
+    )
     assert result["delivery"]["ts"] == "123.1"
 
 
@@ -281,8 +289,7 @@ def test_handler_posts_long_dm_results_as_replies_to_the_first_message():
 
     result = asyncio.run(console_workflow.handler(params, context))
 
-    assert context.step_calls == ELIGIBILITY_STEPS + [
-        "post_result",
+    assert context.step_calls == ACTION_STEPS + [
         "post_result_reply_1",
         "post_result_reply_2",
     ]
@@ -296,31 +303,30 @@ def test_handler_posts_long_dm_results_as_replies_to_the_first_message():
     assert context.slack_calls[0] == (
         "U0123456789",
         "a" * console_workflow.SLACK_MESSAGE_CHUNK_MAX_LENGTH,
-        {"mrkdwn": True},
+        slack_args(0),
     )
     assert all(
         call[0] == "D0123456789"
-        and call[2] == {"mrkdwn": True, "thread_ts": "123.1"}
-        for call in context.slack_calls[1:-1]
+        and call[2] == slack_args(index, thread_ts="123.1")
+        for index, call in enumerate(context.slack_calls[1:-1], start=1)
     )
     footer = "Sent by <@U0123456789>'s scheduled task"
     final_body = context.slack_calls[-1][1].removesuffix(f"\n\n{footer}")
     assert context.slack_calls[-1] == (
         "D0123456789",
         f"{final_body}\n\n{footer}",
-        {
-            "thread_ts": "123.1",
-            "mrkdwn": True,
-            "blocks": scheduled_task_blocks(final_body, footer),
-        },
+        slack_args(
+            2,
+            thread_ts="123.1",
+            blocks=scheduled_task_blocks(final_body, footer),
+        ),
     )
     assert len(result["delivery"]["replies"]) == 2
 
     asyncio.run(console_workflow.handler(params, context))
 
     assert context.step_calls == (
-        ELIGIBILITY_STEPS
-        + ["post_result", "post_result_reply_1", "post_result_reply_2"]
+        ACTION_STEPS + ["post_result_reply_1", "post_result_reply_2"]
     ) * 2
     assert len(context.slack_calls) == 3
 
@@ -354,10 +360,7 @@ def test_handler_delivers_canonical_result_text_instead_of_output_lines():
         (
             "C0123456789",
             f"{body}\n\n{footer}",
-            {
-                "mrkdwn": True,
-                "blocks": scheduled_task_blocks(body, footer),
-            },
+            slack_args(0, blocks=scheduled_task_blocks(body, footer)),
         )
     ]
 
@@ -378,15 +381,12 @@ def test_handler_does_not_repeat_checkpointed_slack_posts():
     asyncio.run(console_workflow.handler(params, context))
 
     assert context.scheduled_task_calls == ["tsk_123", "tsk_123"]
-    assert context.step_calls == (ELIGIBILITY_STEPS + ["post_result"]) * 2
+    assert context.step_calls == ACTION_STEPS * 2
     assert context.slack_calls == [
         (
             "C0123456789",
             f"Daily summary\n\n{footer}",
-            {
-                "mrkdwn": True,
-                "blocks": scheduled_task_blocks("Daily summary", footer),
-            },
+            slack_args(0, blocks=scheduled_task_blocks("Daily summary", footer)),
         )
     ]
 
@@ -411,10 +411,7 @@ def test_handler_uses_a_generic_footer_for_an_in_flight_run_without_an_author():
         (
             "C0123456789",
             f"Daily summary\n\n{footer}",
-            {
-                "mrkdwn": True,
-                "blocks": scheduled_task_blocks("Daily summary", footer),
-            },
+            slack_args(0, blocks=scheduled_task_blocks("Daily summary", footer)),
         )
     ]
 

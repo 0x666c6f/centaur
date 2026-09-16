@@ -1450,13 +1450,13 @@ These endpoints use the sandbox entitlement JWT injected by `iron-proxy`. Every 
 | `GET` | `/api/v1/sandbox/scheduled_tasks` | List the linked user's tasks. |
 | `GET` | `/api/v1/sandbox/scheduled_tasks/:id` | Read one owned task by `tsk_...` OID. |
 | `POST` | `/api/v1/sandbox/scheduled_tasks` | Create a task from `data.name`, `data.prompt`, `data.delivery_channel`, and optional `data.cron_expression` and `data.enabled`. |
-| `PUT`/`PATCH` | `/api/v1/sandbox/scheduled_tasks/:id` | Update any supplied task fields. |
+| `PUT`/`PATCH` | `/api/v1/sandbox/scheduled_tasks/:id` | Update any supplied task fields. Set `data.cron_expression` to `null` to make the task manual-only. |
 | `DELETE` | `/api/v1/sandbox/scheduled_tasks/:id` | Delete an owned task. Returns `204`. |
 | `POST` | `/api/v1/sandbox/scheduled_tasks/:id/run` | Queue an immediate run. Returns `202`; disabled tasks return `422`. |
 
 The admin API also exposes `GET /api/v1/scheduled_tasks/:id` for the workflow runtime to read current enabled, owner, principal, and delivery state. It requires an active admin API key, returns `404` for deleted tasks, and sets `Cache-Control: no-store`. The `principal` is `null` until the task author has an execution principal; this read does not provision one.
 
-Responses include the task's optional cron expression, fixed timezone, human-readable schedule, enabled state, next run time, and latest run metadata. The `centaur-console` CLI exposes the same operations through `tasks`, `task`, `create-task`, `update-task`, `delete-task`, and `run-task`.
+Responses include the task's optional cron expression, fixed timezone, human-readable schedule, enabled state, next run time, and latest run metadata. The `centaur-console` CLI exposes the same operations through `tasks`, `task`, `create-task`, `update-task`, `delete-task`, and `run-task`; pass `update-task --manual` to remove a recurring schedule.
 
 ## Skills
 

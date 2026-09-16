@@ -39,6 +39,7 @@ async def _deliver_to_slack(
     channel: str,
     text: str,
     slack_user_id: str,
+    eligibility_check: Any,
 ) -> Any:
     footer = _scheduled_task_footer(slack_user_id)
     footer_suffix = f"\n\n{footer}"
@@ -52,15 +53,27 @@ async def _deliver_to_slack(
         chunks.append(footer)
 
     def message_args(index: int) -> dict[str, Any]:
-        args: dict[str, Any] = {"mrkdwn": True}
+        args: dict[str, Any] = {
+            "mrkdwn": True,
+            # Preserve the pre-eligibility workflow's request-derived IDs so
+            # in-flight runs remain idempotent across rollout.
+            "client_msg_id": f"{ctx.task_id}:slack:{3 + (3 * index)}",
+        }
         if index == len(chunks) - 1:
             args["blocks"] = _scheduled_task_blocks(final_body, footer)
         return args
 
-    root = await ctx.step(
-        "post_result",
-        lambda: ctx.post_to_slack(channel, chunks[0], **message_args(0)),
-    )
+    async def post_root() -> Any:
+        if not await eligibility_check():
+            return {
+                "status": "skipped",
+                "reason": "scheduled_task_not_executable",
+            }
+        return await ctx.post_to_slack(channel, chunks[0], **message_args(0))
+
+    root = await ctx.step("post_result", post_root)
+    if isinstance(root, dict) and root.get("status") == "skipped":
+        return root
     if len(chunks) == 1:
         return root
     if not isinstance(root, dict):
@@ -178,60 +191,56 @@ async def handler(params: Any, ctx: Any) -> dict[str, Any]:
     scheduled_task_id = _required_string(params, "scheduled_task_id")
     slack_user_id = str(params.get("slack_user_id") or "").strip()
 
-    execution_eligible = await ctx.step(
-        "execution_eligibility",
-        lambda: _task_is_executable_now(
+    async def run_agent() -> dict[str, Any]:
+        if not await _task_is_executable_now(
             ctx,
             task_id=scheduled_task_id,
             principal=principal,
             channel=channel,
-        ),
-    )
-    if not execution_eligible:
-        return {
-            "status": "skipped",
-            "reason": "scheduled_task_not_executable",
-            "scheduled_task_id": scheduled_task_id,
-        }
+        ):
+            return {
+                "status": "skipped",
+                "reason": "scheduled_task_not_executable",
+                "scheduled_task_id": scheduled_task_id,
+            }
 
-    message_id = f"absurd-workflow:{ctx.task_id}:1:user"
-    result = await ctx.agent_turn(
-        _prompt_for_slack(prompt),
-        principal=principal,
-        message_id=message_id,
-        idempotency_key=f"absurd-workflow-agent-turn:{message_id}",
-        metadata={
-            "scheduled_task_id": scheduled_task_id,
-            "scheduled_task_name": str(params.get("scheduled_task_name") or ""),
-        },
-    )
+        message_id = f"absurd-workflow:{ctx.task_id}:1:user"
+        return await ctx.agent_turn(
+            _prompt_for_slack(prompt),
+            principal=principal,
+            message_id=message_id,
+            idempotency_key=f"absurd-workflow-agent-turn:{message_id}",
+            metadata={
+                "scheduled_task_id": scheduled_task_id,
+                "scheduled_task_name": str(params.get("scheduled_task_name") or ""),
+            },
+        )
+
+    result = await ctx.step("agent_result", run_agent)
+    if result.get("status") == "skipped":
+        return result
     response_text = str(result.get("result_text") or "").strip()
     if not response_text:
         response_text = "The task completed without a text response."
-
-    delivery_eligible = await ctx.step(
-        "delivery_eligibility",
-        lambda: _task_is_executable_now(
-            ctx,
-            task_id=scheduled_task_id,
-            principal=principal,
-            channel=channel,
-        ),
-    )
-    if not delivery_eligible:
-        return {
-            "status": "skipped",
-            "reason": "scheduled_task_not_executable",
-            "scheduled_task_id": scheduled_task_id,
-            "agent_result": result,
-        }
 
     delivery = await _deliver_to_slack(
         ctx,
         channel,
         response_text,
         slack_user_id,
+        lambda: _task_is_executable_now(
+            ctx,
+            task_id=scheduled_task_id,
+            principal=principal,
+            channel=channel,
+        ),
     )
+    if isinstance(delivery, dict) and delivery.get("status") == "skipped":
+        return {
+            **delivery,
+            "scheduled_task_id": scheduled_task_id,
+            "agent_result": result,
+        }
 
     return {
         "agent_result": result,

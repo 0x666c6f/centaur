@@ -94,6 +94,22 @@ class Api::V1::SandboxScheduledTasksControllerTest < ActionDispatch::Integration
     assert_equal "Manual only", json_body.dig("data", "schedule_label")
   end
 
+  test "linked user converts a scheduled task to manual-only with null cron" do
+    task = create_task(author: @user, name: "Make manual")
+
+    with_token(@proxy) do |headers|
+      patch "/api/v1/sandbox/scheduled_tasks/#{task.oid}",
+            params: { data: { cron_expression: nil } },
+            headers: headers,
+            as: :json
+    end
+
+    assert_response :ok
+    assert_nil task.reload.cron_expression
+    assert_nil task.next_run_at
+    assert_equal "Manual only", json_body.dig("data", "schedule_label")
+  end
+
   test "list and lookup are limited to the linked user's tasks" do
     own_task = create_task(author: @user, name: "My task")
     other_task = create_task(author: users(:globex_admin), name: "Other task")
@@ -109,6 +125,27 @@ class Api::V1::SandboxScheduledTasksControllerTest < ActionDispatch::Integration
       get "/api/v1/sandbox/scheduled_tasks/#{other_task.oid}", headers: headers
     end
     assert_response :not_found
+  end
+
+  test "blank cron input is invalid rather than manual-only" do
+    assert_no_difference("ScheduledTask.count") do
+      with_token(@proxy) do |headers|
+        post "/api/v1/sandbox/scheduled_tasks",
+             params: {
+               data: {
+                 name: "Blank schedule",
+                 prompt: "Do something.",
+                 delivery_channel: "dm",
+                 cron_expression: "  "
+               }
+             },
+             headers: headers,
+             as: :json
+      end
+    end
+
+    assert_response :unprocessable_entity
+    assert_includes json_body.dig("error", "details", "cron_expression"), "is not a valid cron schedule"
   end
 
   test "invalid task attributes return validation details" do

@@ -151,9 +151,13 @@ class ConsoleClient:
         cron_expression: str | None = None,
         delivery_channel: str | None = None,
         enabled: bool | None = None,
+        clear_schedule: bool = False,
     ) -> dict[str, Any]:
         """Update selected fields on a scheduled task owned by the current Console user."""
-        attributes: dict[str, str | bool] = {}
+        if clear_schedule and cron_expression is not None:
+            raise ValueError("cron_expression and clear_schedule are mutually exclusive")
+
+        attributes: dict[str, str | bool | None] = {}
         for key, value in {
             "name": name,
             "prompt": prompt,
@@ -163,6 +167,8 @@ class ConsoleClient:
         }.items():
             if value is not None:
                 attributes[key] = value
+        if clear_schedule:
+            attributes["cron_expression"] = None
         if not attributes:
             raise ValueError("at least one scheduled task field must be provided")
 
