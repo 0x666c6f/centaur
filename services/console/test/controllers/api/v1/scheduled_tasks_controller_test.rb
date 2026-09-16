@@ -22,12 +22,8 @@ module Api
       end
 
       test "returns current task execution state without task content or writes" do
-        principal = @task.execution_principal
-
         assert_no_difference -> { Principal.count } do
-          assert_no_changes -> { principal.reload.updated_at } do
-            get @path, headers: auth_headers
-          end
+          get @path, headers: auth_headers
         end
 
         assert_response :ok
@@ -36,34 +32,20 @@ module Api
           {
             "id" => @task.oid,
             "enabled" => true,
-            "author_active" => true,
-            "principal" => principal.foreign_id,
-            "delivery_channel" => "C0123456789",
-            "delivery_allowed" => true
+            "delivery_channel" => "C0123456789"
           },
           response.parsed_body.fetch("data")
         )
         assert_not_includes response.body, @task.prompt
       end
 
-      test "returns no principal without provisioning one" do
-        assert_no_difference -> { Principal.count } do
-          get @path, headers: auth_headers
-        end
-
-        assert_response :ok
-        assert_nil response.parsed_body.dig("data", "principal")
-      end
-
-      test "returns current disabled author and delivery state" do
+      test "returns current disabled state" do
         @task.update!(enabled: false)
-        @author.update!(status: :disabled)
 
-        get @path, headers: auth_headers(token: "iak_globex-ci-token")
+        get @path, headers: auth_headers
 
         assert_response :ok
         assert_equal false, response.parsed_body.dig("data", "enabled")
-        assert_equal false, response.parsed_body.dig("data", "author_active")
       end
 
       test "returns not found after deletion" do

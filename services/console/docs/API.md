@@ -1454,7 +1454,7 @@ These endpoints use the sandbox entitlement JWT injected by `iron-proxy`. Every 
 | `DELETE` | `/api/v1/sandbox/scheduled_tasks/:id` | Delete an owned task. Returns `204`. |
 | `POST` | `/api/v1/sandbox/scheduled_tasks/:id/run` | Queue an immediate run. Returns `202`; disabled tasks return `422`. |
 
-The admin API also exposes `GET /api/v1/scheduled_tasks/:id` for the workflow runtime to read current enabled, owner, principal, and delivery state. It requires an active admin API key, returns `404` for deleted tasks, and sets `Cache-Control: no-store`. The `principal` is `null` until the task author has an execution principal; this read does not provision one.
+The admin API also exposes `GET /api/v1/scheduled_tasks/:id` for scheduled workflows to read the task's current ID, enabled state, and delivery channel. It requires an active admin API key, returns `404` for deleted tasks, and sets `Cache-Control: no-store`.
 
 Responses include the task's optional cron expression, fixed timezone, human-readable schedule, enabled state, next run time, and latest run metadata. The `centaur-console` CLI exposes the same operations through `tasks`, `task`, `create-task`, `update-task`, `delete-task`, and `run-task`; pass `update-task --manual` to remove a recurring schedule.
 

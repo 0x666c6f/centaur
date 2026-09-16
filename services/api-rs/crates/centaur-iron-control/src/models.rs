@@ -84,21 +84,6 @@ impl SecretSource {
 }
 
 // ---------------------------------------------------------------------------
-// Scheduled tasks
-// ---------------------------------------------------------------------------
-
-/// Current execution state for a Console scheduled task.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScheduledTask {
-    pub id: String,
-    pub enabled: bool,
-    pub author_active: bool,
-    pub principal: Option<String>,
-    pub delivery_channel: String,
-    pub delivery_allowed: bool,
-}
-
-// ---------------------------------------------------------------------------
 // Request rules
 // ---------------------------------------------------------------------------
 

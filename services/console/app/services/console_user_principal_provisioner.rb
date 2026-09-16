@@ -7,13 +7,6 @@ class ConsoleUserPrincipalProvisioner
     new(user).call
   end
 
-  def self.foreign_id_for(user)
-    normalized = user.email.to_s.downcase.strip
-    safe = normalized.gsub(/[^A-Za-z0-9\-._~]/, "-").gsub(/-+/, "-").first(48)
-    digest = Digest::SHA256.hexdigest(normalized).first(12)
-    "console-user-#{safe}-#{digest}"
-  end
-
   def initialize(user)
     @user = user
   end
@@ -43,7 +36,10 @@ class ConsoleUserPrincipalProvisioner
   attr_reader :user
 
   def foreign_id
-    self.class.foreign_id_for(user)
+    normalized = user.email.to_s.downcase.strip
+    safe = normalized.gsub(/[^A-Za-z0-9\-._~]/, "-").gsub(/-+/, "-").first(48)
+    digest = Digest::SHA256.hexdigest(normalized).first(12)
+    "console-user-#{safe}-#{digest}"
   end
 
   def slack_identity_fields

@@ -143,11 +143,6 @@ class WorkflowContext:
             request["timeout_seconds"] = duration_seconds(timeout)
         return await self._rpc.request(request)
 
-    async def get_scheduled_task(self, task_id: str) -> dict[str, Any] | None:
-        return await self._rpc.request(
-            {"type": "ctx.scheduled_task.get", "task_id": task_id}
-        )
-
     async def agent_turn(self, text: str | None = None, **kwargs: Any) -> Any:
         # Per-workflow AGENT_DEFAULTS (model / provider / reasoning / harness,
         # ...) form the base; explicit per-call kwargs override them key by key.

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any
+from urllib.parse import quote
+
+import httpx
 
 WORKFLOW_NAME = "console_workflow"
 SLACK_MESSAGE_MAX_LENGTH = 50_000
@@ -150,38 +154,37 @@ def _prompt_for_slack(prompt: str) -> str:
     )
 
 
-def _task_is_executable(
-    task: Any,
-    *,
-    task_id: str,
-    principal: str,
-    channel: str,
-) -> bool:
+async def _get_scheduled_task(task_id: str) -> dict[str, Any] | None:
+    base_url = os.environ["IRON_CONTROL_URL"].rstrip("/")
+    api_key = os.environ["IRON_CONTROL_API_KEY"]
+    url = f"{base_url}/api/v1/scheduled_tasks/{quote(task_id, safe='')}"
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.get(
+            url,
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+    if response.status_code == httpx.codes.NOT_FOUND:
+        return None
+    response.raise_for_status()
+    body = response.json()
+    task = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(task, dict):
+        raise ValueError("scheduled task response must contain a data object")
+    return task
+
+
+def _task_is_executable(task: Any, *, task_id: str, channel: str) -> bool:
     return (
         isinstance(task, dict)
         and task.get("id") == task_id
         and task.get("enabled") is True
-        and task.get("author_active") is True
-        and task.get("principal") == principal
         and task.get("delivery_channel") == channel
-        and task.get("delivery_allowed") is True
     )
 
 
-async def _task_is_executable_now(
-    ctx: Any,
-    *,
-    task_id: str,
-    principal: str,
-    channel: str,
-) -> bool:
-    task = await ctx.get_scheduled_task(task_id)
-    return _task_is_executable(
-        task,
-        task_id=task_id,
-        principal=principal,
-        channel=channel,
-    )
+async def _task_is_executable_now(*, task_id: str, channel: str) -> bool:
+    task = await _get_scheduled_task(task_id)
+    return _task_is_executable(task, task_id=task_id, channel=channel)
 
 
 async def handler(params: Any, ctx: Any) -> dict[str, Any]:
@@ -193,9 +196,7 @@ async def handler(params: Any, ctx: Any) -> dict[str, Any]:
 
     async def run_agent() -> dict[str, Any]:
         if not await _task_is_executable_now(
-            ctx,
             task_id=scheduled_task_id,
-            principal=principal,
             channel=channel,
         ):
             return {
@@ -229,9 +230,7 @@ async def handler(params: Any, ctx: Any) -> dict[str, Any]:
         response_text,
         slack_user_id,
         lambda: _task_is_executable_now(
-            ctx,
             task_id=scheduled_task_id,
-            principal=principal,
             channel=channel,
         ),
     )
