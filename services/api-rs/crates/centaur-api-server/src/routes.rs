@@ -836,8 +836,19 @@ async fn interrupt_session_execution(
     }))
 }
 
-async fn drain_sandboxes(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let report = state.runtime()?.drain().await?;
+#[derive(Debug, Default, serde::Deserialize)]
+struct DrainQuery {
+    /// When true, stop every non-terminal sandbox even if it has an active
+    /// execution. Defaults to false, which leaves busy sandboxes running.
+    #[serde(default)]
+    force: bool,
+}
+
+async fn drain_sandboxes(
+    State(state): State<AppState>,
+    Query(query): Query<DrainQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let report = state.runtime()?.drain(query.force).await?;
     let failed = report
         .failed
         .iter()
@@ -847,6 +858,8 @@ async fn drain_sandboxes(State(state): State<AppState>) -> Result<Json<Value>, A
         "ok": report.failed.is_empty(),
         "stopped_count": report.stopped.len(),
         "stopped": report.stopped,
+        "busy_count": report.busy.len(),
+        "busy": report.busy,
         "failed": failed,
     })))
 }

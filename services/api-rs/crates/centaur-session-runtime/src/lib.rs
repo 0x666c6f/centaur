@@ -356,6 +356,9 @@ pub struct CreateOrGetSessionOutcome {
 pub struct DrainReport {
     pub stopped: Vec<String>,
     pub failed: Vec<DrainFailure>,
+    /// Sandboxes left running because their session has an active execution.
+    /// Only populated when the drain is not forced.
+    pub busy: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -2004,7 +2007,17 @@ impl SessionRuntime {
     /// each sandbox is stopped independently so one failure does not abort the
     /// rest, and the [`DrainReport`] records which were stopped and which
     /// failed so the caller can surface partial failure.
-    pub async fn drain(&self) -> Result<DrainReport, SessionRuntimeError> {
+    ///
+    /// Without `force`, sandboxes whose session has a queued or running
+    /// execution are left running and reported as `busy` so a rollout can wait
+    /// for in-flight turns to finish instead of killing them mid-response. With
+    /// `force`, every non-terminal sandbox is stopped regardless.
+    pub async fn drain(&self, force: bool) -> Result<DrainReport, SessionRuntimeError> {
+        let busy: std::collections::HashSet<String> = if force {
+            std::collections::HashSet::new()
+        } else {
+            self.store.busy_sandbox_ids().await?.into_iter().collect()
+        };
         let observed = self.sandbox_runtime.manager.list_observed().await?;
         let mut report = DrainReport::default();
         for sandbox in observed {
@@ -2012,6 +2025,10 @@ impl SessionRuntime {
                 continue;
             }
             let id = sandbox.id.as_str().to_owned();
+            if busy.contains(&id) {
+                report.busy.push(id);
+                continue;
+            }
             match self.sandbox_runtime.manager.stop(&sandbox.id).await {
                 Ok(()) => {
                     self.sandbox_pipes.remove(&id);
@@ -11382,6 +11399,37 @@ mod adoption_tests {
             Some("Completed after reattach.")
         );
         assert_eq!(backend.opens(), 2);
+        reset_test_store(&store).await;
+    }
+
+    /// A drain issued during a rollout must not kill a sandbox whose session
+    /// still has an in-flight turn, unless the caller forces it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_skips_busy_sandbox_unless_forced() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:drain-busy-{}", uuid::Uuid::new_v4())).unwrap();
+        // A session that owns a sandbox and has a running execution is "busy".
+        let _execution_id = orphaned_execution(&store, &thread_key, Some("sbx-busy"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        backend.set_observed_status("sbx-busy", SandboxStatus::Running);
+        let runtime = runtime_with(&store, backend.clone());
+
+        // An unforced drain leaves the busy sandbox running and reports it.
+        let report = runtime.drain(false).await.expect("drain");
+        assert_eq!(report.busy, vec!["sbx-busy".to_owned()]);
+        assert!(report.stopped.is_empty(), "busy sandbox must not be stopped");
+        assert!(backend.stopped().is_empty());
+
+        // A forced drain stops it regardless of the active execution.
+        let report = runtime.drain(true).await.expect("force drain");
+        assert!(report.busy.is_empty());
+        assert_eq!(report.stopped, vec!["sbx-busy".to_owned()]);
+        assert_eq!(backend.stopped(), vec!["sbx-busy".to_owned()]);
         reset_test_store(&store).await;
     }
 

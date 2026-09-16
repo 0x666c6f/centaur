@@ -634,6 +634,26 @@ impl PgSessionStore {
         row.try_into().map(Some)
     }
 
+    /// Sandboxes whose session still has a queued or running execution. Used
+    /// by a busy-aware drain so a rollout can leave in-flight turns running.
+    pub async fn busy_sandbox_ids(&self) -> Result<Vec<String>, SessionStoreError> {
+        let rows = sqlx::query_scalar::<_, String>(
+            r#"
+            select distinct sessions.sandbox_id
+            from sessions
+            join session_executions on session_executions.thread_key = sessions.thread_key
+            where sessions.sandbox_id is not null
+              and session_executions.status in ($1, $2)
+            "#,
+        )
+        .bind(ExecutionStatus::Queued.as_ref())
+        .bind(ExecutionStatus::Running.as_ref())
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     pub async fn claim_stdout_owner(
         &self,
         execution_id: &str,
