@@ -147,6 +147,24 @@ impl IronControlClient {
         decode_data(resp, Method::GET, &path).await
     }
 
+    /// Read live scheduled-task state, including its owner and delivery policy.
+    /// Missing/deleted tasks return false; transport and authentication errors fail closed.
+    pub async fn scheduled_task_executable(
+        &self,
+        task_id: &str,
+        principal: &str,
+        channel: &str,
+    ) -> Result<bool> {
+        let path = format!(
+            "{API_PREFIX}/scheduled_tasks/{}/executable?principal={}&channel={}",
+            urlencoding::encode(task_id),
+            urlencoding::encode(principal),
+            urlencoding::encode(channel),
+        );
+        let resp = self.send(Method::GET, &path, None::<&Value>).await?;
+        decode_data(resp, Method::GET, &path).await
+    }
+
     /// Assign a role (by OID) to a principal (by OID).
     pub async fn assign_role(&self, principal_id: &str, role_id: &str) -> Result<()> {
         let path = format!(

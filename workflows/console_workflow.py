@@ -61,6 +61,8 @@ async def _deliver_to_slack(
         "post_result",
         lambda: ctx.post_to_slack(channel, chunks[0], **message_args(0)),
     )
+    if isinstance(root, dict) and root.get("status") == "skipped":
+        return root
     if len(chunks) == 1:
         return root
     if not isinstance(root, dict):
@@ -81,6 +83,8 @@ async def _deliver_to_slack(
                 **message_args(index),
             ),
         )
+        if isinstance(reply, dict) and reply.get("status") == "skipped":
+            return {**reply, "root": root, "replies": replies}
         replies.append(reply)
     return {**root, "replies": replies}
 
@@ -152,6 +156,8 @@ async def handler(params: Any, ctx: Any) -> dict[str, Any]:
             "scheduled_task_name": str(params.get("scheduled_task_name") or ""),
         },
     )
+    if result.get("status") == "skipped":
+        return {**result, "scheduled_task_id": scheduled_task_id}
     response_text = str(result.get("result_text") or "").strip()
     if not response_text:
         response_text = "The task completed without a text response."

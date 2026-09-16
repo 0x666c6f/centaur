@@ -108,6 +108,11 @@ class ScheduledTask < ApplicationRecord
     ConsoleUserPrincipalProvisioner.call(author)
   end
 
+  def executable_by?(principal, channel)
+    enabled? && author.active? && principal&.console_user_id == author_id &&
+      delivery_channel == channel && SlackDeliveryPolicy.new(author).allowed?(channel)
+  end
+
   def api_input
     delivery_policy = SlackDeliveryPolicy.new(author)
     unless delivery_policy.allowed?(delivery_channel)

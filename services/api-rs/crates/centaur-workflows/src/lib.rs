@@ -218,6 +218,7 @@ struct WorkflowQueueClients {
     slack_live: Client,
     etl: Client,
     etl_backfill: Client,
+    console: IronControlClient,
 }
 
 #[derive(Clone)]
@@ -612,6 +613,7 @@ impl WorkflowRuntime {
             slack_live: slack_live_client.clone(),
             etl: etl_client.clone(),
             etl_backfill: etl_backfill_client.clone(),
+            console: workflow_principal_registrar.client.clone(),
         };
 
         let discovery = discover_python_workflow_metadata().await?;
@@ -3362,6 +3364,22 @@ async fn handle_python_context_request(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
+    // Do not checkpoint this read: a queued/replayed run must observe a task
+    // disabled or deleted since it was enqueued, including during its agent turn.
+    if input.workflow_name == "console_workflow"
+        && matches!(
+            message.get("type").and_then(Value::as_str),
+            Some("ctx.agent_turn" | "ctx.post_to_slack")
+        )
+        && !console_task_executable(input, &workflow_clients.console).await?
+    {
+        return Ok(json!({
+            "type": "ctx.response",
+            "request_id": request_id,
+            "ok": true,
+            "value": {"status": "skipped", "reason": "scheduled_task_not_executable"},
+        }));
+    }
     let result = match message.get("type").and_then(Value::as_str) {
         Some("ctx.step.get") => {
             let step = message
@@ -3518,6 +3536,29 @@ async fn handle_python_context_request(
             "error": error,
         }),
     })
+}
+
+async fn console_task_executable(
+    input: &WorkflowTaskInput,
+    console: &IronControlClient,
+) -> Result<bool, WorkflowRuntimeError> {
+    let required = |key: &str| {
+        input
+            .input
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                WorkflowRuntimeError::BadRequest(format!("console_workflow requires {key}"))
+            })
+    };
+    Ok(console
+        .scheduled_task_executable(
+            required("scheduled_task_id")?,
+            required("principal")?,
+            required("channel")?,
+        )
+        .await?)
 }
 
 async fn start_python_child_workflow(
@@ -4584,6 +4625,64 @@ pub enum WorkflowRuntimeError {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[tokio::test]
+    async fn console_task_gate_reads_fresh_state_and_fails_closed() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let console = IronControlClient::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            "test-key",
+        );
+        let server = tokio::spawn(async move {
+            for (status, body) in [
+                ("200 OK", r#"{"data":true}"#),
+                ("200 OK", r#"{"data":false}"#),
+                ("503 Service Unavailable", r#"{"error":"unavailable"}"#),
+                ("200 OK", r#"{"data":"true"}"#),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0; 1024];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buf[..n]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.starts_with("GET /api/v1/scheduled_tasks/tsk_123/executable?principal=console-user-author&channel=U0123456789 HTTP/1.1"));
+                assert!(
+                    request
+                        .to_lowercase()
+                        .contains("authorization: bearer test-key")
+                );
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let input = WorkflowTaskInput {
+            workflow_name: "console_workflow".to_owned(),
+            input: json!({"scheduled_task_id":"tsk_123", "principal":"console-user-author", "channel":"U0123456789"}),
+            harness_type: HarnessType::Codex,
+            slack_button_feedback: None,
+        };
+        assert!(console_task_executable(&input, &console).await.unwrap());
+        assert!(!console_task_executable(&input, &console).await.unwrap());
+        assert!(console_task_executable(&input, &console).await.is_err());
+        assert!(console_task_executable(&input, &console).await.is_err());
+        server.await.unwrap();
+
+        for key in ["scheduled_task_id", "principal", "channel"] {
+            let mut invalid = input.clone();
+            invalid.input.as_object_mut().unwrap().remove(key);
+            assert!(matches!(
+                console_task_executable(&invalid, &console).await,
+                Err(WorkflowRuntimeError::BadRequest(_))
+            ));
+        }
+    }
 
     async fn assert_structured_host_error_is_bounded(message_type: &str) {
         let stderr_task = tokio::spawn(async {

@@ -14,10 +14,14 @@ class FakeContext:
         result_text: str = "Daily summary",
         output_lines=None,
         slack_response_channel=None,
+        skip_agent=False,
+        skip_post_after=None,
     ) -> None:
         self.result_text = result_text
         self.output_lines = output_lines or []
         self.slack_response_channel = slack_response_channel
+        self.skip_agent = skip_agent
+        self.skip_post_after = skip_post_after
         self.agent_calls = []
         self.step_calls = []
         self.step_results = {}
@@ -25,6 +29,8 @@ class FakeContext:
 
     async def agent_turn(self, prompt, **kwargs):
         self.agent_calls.append((prompt, kwargs))
+        if self.skip_agent:
+            return {"status": "skipped", "reason": "scheduled_task_not_executable"}
         return {
             "result_text": self.result_text,
             "output_lines": self.output_lines,
@@ -38,6 +44,11 @@ class FakeContext:
         return self.step_results[name]
 
     async def post_to_slack(self, channel, text, **kwargs):
+        if (
+            self.skip_post_after is not None
+            and len(self.slack_calls) >= self.skip_post_after
+        ):
+            return {"status": "skipped", "reason": "scheduled_task_not_executable"}
         self.slack_calls.append((channel, text, kwargs))
         return {
             "channel": self.slack_response_channel or channel,
@@ -187,7 +198,9 @@ def test_handler_threads_and_truncates_long_channel_results():
 
 def test_handler_posts_long_dm_results_as_replies_to_the_first_message():
     response_text = "a" * (console_workflow.SLACK_MESSAGE_CHUNK_MAX_LENGTH * 2 + 25)
-    context = FakeContext(result_text=response_text, slack_response_channel="D0123456789")
+    context = FakeContext(
+        result_text=response_text, slack_response_channel="D0123456789"
+    )
     params = {
         "prompt": "Summarize open incidents",
         "principal": "console-user-author",
@@ -216,8 +229,7 @@ def test_handler_posts_long_dm_results_as_replies_to_the_first_message():
         {"mrkdwn": True},
     )
     assert all(
-        call[0] == "D0123456789"
-        and call[2] == {"mrkdwn": True, "thread_ts": "123.1"}
+        call[0] == "D0123456789" and call[2] == {"mrkdwn": True, "thread_ts": "123.1"}
         for call in context.slack_calls[1:-1]
     )
     footer = "Sent by <@U0123456789>'s scheduled task"
@@ -235,11 +247,15 @@ def test_handler_posts_long_dm_results_as_replies_to_the_first_message():
 
     asyncio.run(console_workflow.handler(params, context))
 
-    assert context.step_calls == [
-        "post_result",
-        "post_result_reply_1",
-        "post_result_reply_2",
-    ] * 2
+    assert (
+        context.step_calls
+        == [
+            "post_result",
+            "post_result_reply_1",
+            "post_result_reply_2",
+        ]
+        * 2
+    )
     assert len(context.slack_calls) == 3
 
 
@@ -348,3 +364,63 @@ def test_handler_rejects_missing_required_input_before_starting_an_agent():
     assert context.agent_calls == []
     assert context.step_calls == []
     assert context.slack_calls == []
+
+
+def test_disabled_queued_run_skips_without_posting_empty_response_fallback():
+    context = FakeContext(skip_agent=True)
+    result = asyncio.run(
+        console_workflow.handler(
+            {
+                "prompt": "Notify when recovered",
+                "principal": "console-user-author",
+                "channel": "U0123456789",
+                "scheduled_task_id": "tsk_123",
+            },
+            context,
+        )
+    )
+
+    assert result == {
+        "status": "skipped",
+        "reason": "scheduled_task_not_executable",
+        "scheduled_task_id": "tsk_123",
+    }
+    assert context.step_calls == []
+    assert context.slack_calls == []
+
+
+def test_task_disabled_during_agent_turn_suppresses_long_result():
+    context = FakeContext(result_text="x" * 8000, skip_post_after=0)
+    result = asyncio.run(
+        console_workflow.handler(
+            {
+                "prompt": "Notify when recovered",
+                "principal": "console-user-author",
+                "channel": "U0123456789",
+                "scheduled_task_id": "tsk_123",
+            },
+            context,
+        )
+    )
+
+    assert result["delivery"]["status"] == "skipped"
+    assert context.step_calls == ["post_result"]
+    assert context.slack_calls == []
+
+
+def test_task_disabled_between_chunks_stops_replies_and_replay():
+    context = FakeContext(result_text="x" * 12000, skip_post_after=1)
+    params = {
+        "prompt": "Notify when recovered",
+        "principal": "console-user-author",
+        "channel": "U0123456789",
+        "scheduled_task_id": "tsk_123",
+    }
+    result = asyncio.run(console_workflow.handler(params, context))
+    assert result["delivery"]["status"] == "skipped"
+    assert len(context.slack_calls) == 1
+    assert context.step_calls == ["post_result", "post_result_reply_1"]
+
+    context.skip_post_after = None
+    asyncio.run(console_workflow.handler(params, context))
+    assert len(context.slack_calls) == 1

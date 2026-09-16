@@ -250,6 +250,8 @@ Rails.application.routes.draw do
       resources :grants, only: %i[show create destroy]
       resources :api_keys, only: %i[index show create destroy]
       resources :proxies, only: %i[index show create update destroy]
+      # Read-only execution gate for the workflow control plane (admin API key).
+      get "scheduled_tasks/:id/executable", to: "scheduled_task_executions#show"
       # Operator-managed broker credentials (ApiKey auth). CRUD + lookup; the
       # rotating token blob is never serialized back.
       resources :broker_credentials, only: %i[index show create update destroy] do
