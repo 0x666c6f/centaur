@@ -5068,7 +5068,13 @@ async fn reattach_session_pipe(
             Ok(observed)
                 if pipe.instance_id.is_some() && observed.instance_id != pipe.instance_id =>
             {
-                return ReattachOutcome::Dead(format!(
+                // The pod we streamed from is gone (no pod UID) or replaced by a
+                // new pod UID while the execution is still live: the eviction /
+                // node-replacement shape, not an agent error. Classify as
+                // Evicted so the turn replays once when no output has persisted.
+                // A genuine agent error keeps the same pod UID and reaches the
+                // Dead arms below.
+                return ReattachOutcome::Evicted(format!(
                     "sandbox instance changed while reattaching stdout (status {:?})",
                     observed.status
                 ));
@@ -5078,7 +5084,9 @@ async fn reattach_session_pipe(
                     Ok(io) => {
                         let parts = io.into_parts();
                         if pipe.instance_id.is_some() && parts.instance_id != pipe.instance_id {
-                            return ReattachOutcome::Dead(
+                            // Replaced between observe and open: same eviction
+                            // shape, so replay rather than fail.
+                            return ReattachOutcome::Evicted(
                                 "sandbox instance changed while opening stdout".to_owned(),
                             );
                         }
@@ -11847,12 +11855,80 @@ mod adoption_tests {
             .iter()
             .find(|event| event.event_type == "session.execution_failed")
             .expect("failed event");
+        // A replaced pod is the eviction shape; with no replayable request the
+        // turn fails with the requester-facing eviction message instead of
+        // inheriting the active execution onto the new pod.
         assert!(
             failed.payload["error"]
                 .as_str()
-                .is_some_and(|error| error.contains("sandbox instance changed")),
-            "replacement should fail rather than inherit the active execution"
+                .is_some_and(|error| error.contains("was replaced")),
+            "replacement should fail (not inherit) with the eviction message"
         );
+        assert!(
+            !all.iter()
+                .any(|event| event.event_type == "session.stdout_pump_reattached"),
+            "must not reattach the pump to the replacement pod"
+        );
+        reset_test_store(&store).await;
+    }
+
+    /// A node replacement deletes the pod we streamed from, so the retained
+    /// Sandbox observes a new pod UID (the instance-mismatch entry, not a
+    /// synthetic Gone). With a persisted request and no output yet, the turn
+    /// must replay exactly once rather than fail as a detached pump.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evicted_replaced_instance_is_replayed_once() {
+        use tokio::io::AsyncReadExt;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:evicted-replaced-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-replaced"), false).await;
+        store
+            .mark_execution_running(&execution_id)
+            .await
+            .expect("mark running");
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let (replay_io, _replay_stdout, mut replay_stdin) = mock_io();
+        backend.push_io(replay_io).await;
+
+        let runtime = runtime_with(&store, backend.clone());
+        claim_test_stdout_owner(&runtime, &execution_id).await;
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-replaced")
+            .await
+            .expect("open initial pipe");
+
+        // Real eviction entry: the pod we streamed from is replaced by a new
+        // pod UID, so observe() reports a different instance than the pipe.
+        backend.set_status(SandboxStatus::Created);
+        drop(stdout);
+        backend.created_observed.notified().await;
+        backend.set_instance_id("replacement-instance");
+        backend.set_status(SandboxStatus::Running);
+
+        wait_for_event(&store, &thread_key, SESSION_EXECUTION_EVICTED_RETRY_EVENT).await;
+        let mut replayed = vec![0_u8; 4096];
+        let read = tokio::time::timeout(Duration::from_secs(5), replay_stdin.read(&mut replayed))
+            .await
+            .expect("replayed input within timeout")
+            .expect("read replayed input");
+        assert!(
+            String::from_utf8_lossy(&replayed[..read]).contains("recover me"),
+            "expected the persisted request to be replayed"
+        );
+        let retry_events = events(&store, &thread_key)
+            .await
+            .into_iter()
+            .filter(|event| event.event_type == SESSION_EXECUTION_EVICTED_RETRY_EVENT)
+            .count();
+        assert_eq!(retry_events, 1, "an instance-mismatch eviction replays exactly once");
         reset_test_store(&store).await;
     }
 
@@ -11934,8 +12010,8 @@ mod adoption_tests {
         };
         let _serial = TEST_LOCK.lock().await;
         let thread_key =
-            ThreadKey::parse(format!("test:eof-gone-{}", uuid::Uuid::new_v4())).unwrap();
-        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-gone"), true).await;
+            ThreadKey::parse(format!("test:eof-stopped-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-stopped"), true).await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let (io, stdout, _stdin) = mock_io();
@@ -11944,10 +12020,13 @@ mod adoption_tests {
         let runtime = runtime_with(&store, backend.clone());
         claim_test_stdout_owner(&runtime, &execution_id).await;
         runtime
-            .ensure_session_pipe(&thread_key, "sbx-gone")
+            .ensure_session_pipe(&thread_key, "sbx-stopped")
             .await
             .expect("open initial pipe");
-        backend.set_status(SandboxStatus::Gone);
+        // A non-eviction terminal status (a crashed/stopped pod, same pod UID)
+        // still fails with the raw pump error; only Gone / instance-mismatch
+        // evictions replay.
+        backend.set_status(SandboxStatus::Stopped);
         drop(stdout);
 
         wait_for_event(&store, &thread_key, "session.execution_failed").await;
@@ -11968,7 +12047,7 @@ mod adoption_tests {
         assert!(
             !all.iter()
                 .any(|event| event.event_type == "session.stdout_pump_reattached"),
-            "gone sandbox should not reattach"
+            "stopped sandbox should not reattach"
         );
         assert_eq!(backend.opens(), 1);
         reset_test_store(&store).await;
