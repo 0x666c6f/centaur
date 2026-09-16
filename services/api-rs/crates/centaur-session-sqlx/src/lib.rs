@@ -634,6 +634,40 @@ impl PgSessionStore {
         row.try_into().map(Some)
     }
 
+    /// Hand a running execution this control plane owns back to the queue in
+    /// one statement (status and stdout lease together), so an eviction replay
+    /// never leaves a running row without an owner. `started_at` is kept so the
+    /// replay runs against the original deadline. Returns the requeued row, or
+    /// `None` when the execution is no longer running or no longer owned by
+    /// `owner_id` (another control plane took it over).
+    pub async fn requeue_execution_if_running_and_stdout_owner(
+        &self,
+        execution_id: &str,
+        owner_id: &str,
+    ) -> Result<Option<SessionExecution>, SessionStoreError> {
+        let row = sqlx::query_as::<_, SessionExecutionRow>(
+            r#"
+            update session_executions
+            set status = $3,
+                stdout_owner_id = null,
+                stdout_owner_lease_expires_at = null,
+                updated_at = now()
+            where execution_id = $1
+              and status = $4
+              and stdout_owner_id = $2
+            returning execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            "#,
+        )
+        .bind(execution_id)
+        .bind(owner_id)
+        .bind(ExecutionStatus::Queued.as_ref())
+        .bind(ExecutionStatus::Running.as_ref())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
     pub async fn claim_stdout_owner(
         &self,
         execution_id: &str,

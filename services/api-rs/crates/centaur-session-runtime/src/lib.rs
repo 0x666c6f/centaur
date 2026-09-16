@@ -61,6 +61,14 @@ use title_generator::{
 
 pub const SESSION_OUTPUT_LINE_EVENT: &str = "session.output.line";
 pub const SESSION_FIRST_TOKEN_EVENT: &str = "session.first_token";
+/// Durable once-only marker for the eviction replay: an execution whose sandbox
+/// was replaced before it produced any output is replayed on a fresh sandbox
+/// exactly once; a second loss fails with the requester-facing message.
+pub const SESSION_EXECUTION_EVICTED_RETRY_EVENT: &str = "session.execution_evicted_retry";
+/// Requester-facing failure message used when a sandbox is replaced mid-turn
+/// and the turn cannot be safely replayed.
+const SANDBOX_EVICTED_REQUESTER_MESSAGE: &str =
+    "The sandbox running this response was replaced before it finished; please re-ask.";
 
 const EVENT_STREAM_SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const STEERING_STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -2561,6 +2569,179 @@ impl SessionRuntime {
         });
     }
 
+    /// The stdout pump found the sandbox replaced mid-turn (eviction, node
+    /// replacement). Replay the turn on a fresh sandbox when the harness had
+    /// not produced any output yet; otherwise fail it with a requester-facing
+    /// message instead of the raw pump error.
+    async fn handle_evicted_execution(
+        &self,
+        ctx: &RuntimeContext,
+        thread_key: &ThreadKey,
+        sandbox_id: &str,
+        execution_id: &str,
+        detail: &str,
+    ) {
+        warn!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "session_execution_sandbox_evicted",
+            thread_key = %thread_key,
+            execution_id,
+            sandbox_id,
+            detail,
+            "sandbox replaced before the turn finished"
+        );
+        match self
+            .retry_evicted_execution(thread_key, sandbox_id, execution_id)
+            .await
+        {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "session_execution_evicted_retry_failed",
+                thread_key = %thread_key,
+                execution_id,
+                sandbox_id,
+                %error,
+                "failed to replay evicted execution; failing it"
+            ),
+        }
+        fail_detached_execution_with(
+            ctx,
+            thread_key,
+            sandbox_id,
+            execution_id,
+            SANDBOX_EVICTED_REQUESTER_MESSAGE.to_owned(),
+        )
+        .await;
+    }
+
+    /// Returns `Ok(true)` when the execution was handed back to the queue and
+    /// re-driven on a new sandbox; `Ok(false)` when it must fail instead (any
+    /// output already persisted, already retried once, no persisted request, or
+    /// the row is no longer ours).
+    ///
+    /// The replay gate is "no `session.output.line` at all", not "no answer
+    /// token": tool calls run before the answer and a replayed side effect (a
+    /// created issue, a posted message) would apply twice. Output rows are
+    /// committed before any marker, so the gate cannot be fooled.
+    async fn retry_evicted_execution(
+        &self,
+        thread_key: &ThreadKey,
+        sandbox_id: &str,
+        execution_id: &str,
+    ) -> Result<bool, SessionRuntimeError> {
+        // Only the current stdout owner may spend the retry allowance: a stale
+        // pump whose lease another control plane took over must not detach the
+        // sandbox or append the marker. Claim before reading the gates so no
+        // other owner can append output between the read and the decision.
+        if self.shutting_down.load(Ordering::SeqCst)
+            || !self
+                .store
+                .claim_stdout_owner(execution_id, &self.stdout_owner_id, STDOUT_OWNER_LEASE)
+                .await?
+        {
+            return Ok(false);
+        }
+        if self
+            .store
+            .execution_event_exists(execution_id, SESSION_OUTPUT_LINE_EVENT)
+            .await?
+            || self
+                .store
+                .execution_event_exists(execution_id, SESSION_EXECUTION_EVICTED_RETRY_EVENT)
+                .await?
+        {
+            return Ok(false);
+        }
+        let input = match self.load_persisted_execute_request(execution_id).await {
+            Ok(input) => input,
+            Err(error) => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_execution_evicted_retry_skipped",
+                    thread_key = %thread_key,
+                    execution_id,
+                    sandbox_id,
+                    %error,
+                    "evicted execution has no replayable request"
+                );
+                return Ok(false);
+            }
+        };
+        // Detach the dead sandbox so the replay creates a fresh one instead of
+        // trying to resume the evicted pod.
+        self.sandbox_pipes.remove(sandbox_id);
+        match self
+            .sandbox_runtime
+            .manager
+            .stop(&SandboxId::new(sandbox_id))
+            .await
+        {
+            Ok(()) | Err(SandboxError::NotFound(_)) => {}
+            Err(error) => return Err(SessionRuntimeError::Sandbox(error)),
+        }
+        self.store.update_sandbox_id(thread_key, None).await?;
+        // The once-only marker lands before the row becomes claimable again, so
+        // a crash between the two leaves a guarded row, never a replayable one.
+        // The requeue releases our stdout lease in the same statement and is a
+        // no-op if another control plane owns the execution, in which case the
+        // caller fails it as before.
+        self.store
+            .append_event(
+                thread_key,
+                Some(execution_id),
+                SESSION_EXECUTION_EVICTED_RETRY_EVENT,
+                json!({
+                    "execution_id": execution_id,
+                    "thread_key": thread_key.as_str(),
+                    "sandbox_id": sandbox_id,
+                }),
+            )
+            .await?;
+        if self
+            .store
+            .requeue_execution_if_running_and_stdout_owner(execution_id, &self.stdout_owner_id)
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        if let Some(span) = self.execution_spans.lock().await.remove(execution_id) {
+            finish_execution_trace_span(&span, "evicted");
+        }
+        let runtime = self.clone();
+        let thread_key = thread_key.clone();
+        let execution_id = execution_id.to_owned();
+        let old_sandbox_id = sandbox_id.to_owned();
+        tokio::spawn(async move {
+            match runtime
+                .execute_session_impl(&thread_key, input, Some(&execution_id), None)
+                .await
+            {
+                Ok(attempt) => info!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_execution_evicted_retry",
+                    thread_key = %thread_key,
+                    execution_id,
+                    old_sandbox_id,
+                    new_sandbox_id = attempt.sandbox_id.as_deref().unwrap_or(""),
+                    "replayed evicted execution on a new sandbox"
+                ),
+                Err(error) => warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_execution_evicted_retry_failed",
+                    thread_key = %thread_key,
+                    execution_id,
+                    old_sandbox_id,
+                    error = %error.into_source(),
+                    "failed to replay evicted execution"
+                ),
+            }
+        });
+        Ok(true)
+    }
+
     async fn load_persisted_execute_request(
         &self,
         execution_id: &str,
@@ -3544,6 +3725,7 @@ impl SessionRuntime {
             let stderr_key = pump_key.clone();
 
             spawn_stdout_pump_loop(StdoutPumpLoop {
+                runtime: self.clone(),
                 ctx,
                 open_lock,
                 thread_key: pump_thread_key,
@@ -4630,6 +4812,8 @@ enum StdoutPumpEnd {
 }
 
 struct StdoutPumpLoop {
+    /// Handle used to replay an execution whose sandbox was evicted mid-turn.
+    runtime: SessionRuntime,
     ctx: RuntimeContext,
     open_lock: Arc<Mutex<()>>,
     thread_key: ThreadKey,
@@ -4651,6 +4835,10 @@ enum ReattachOutcome {
     Retryable(String),
     /// The sandbox cannot serve IO anymore.
     Dead(String),
+    /// The sandbox disappeared for an infrastructure reason (the pod is Gone or
+    /// no longer exists) rather than an agent error, so the turn may be
+    /// replayable on a fresh sandbox.
+    Evicted(String),
 }
 
 fn session_pipe_from_parts(stdin: SandboxWrite, instance_id: Option<String>) -> SessionPipe {
@@ -4685,6 +4873,7 @@ fn remove_pipe_if_current(sandbox_pipes: &SessionPipeMap, sandbox_id: &str, pipe
 fn spawn_stdout_pump_loop(state: StdoutPumpLoop) {
     tokio::spawn(async move {
         let StdoutPumpLoop {
+            runtime,
             ctx,
             open_lock,
             thread_key,
@@ -4835,6 +5024,18 @@ fn spawn_stdout_pump_loop(state: StdoutPumpLoop) {
                         .await;
                         break 'pump;
                     }
+                    ReattachOutcome::Evicted(detail) => {
+                        runtime
+                            .handle_evicted_execution(
+                                &ctx,
+                                &thread_key,
+                                &sandbox_id,
+                                &execution.execution_id,
+                                &detail,
+                            )
+                            .await;
+                        break 'pump;
+                    }
                 }
             }
         }
@@ -4938,13 +5139,17 @@ async fn reattach_session_pipe(
                 .await;
             }
             Ok(observed) => {
-                return ReattachOutcome::Dead(sandbox_dead_detail(
-                    &observed.status,
-                    observed.reason.as_deref(),
-                ));
+                let detail = sandbox_dead_detail(&observed.status, observed.reason.as_deref());
+                // A `Gone` pod is an infrastructure disappearance (eviction,
+                // node replacement), not an agent error, so the turn may be
+                // replayable. Every other terminal status is a real death.
+                if observed.status == SandboxStatus::Gone {
+                    return ReattachOutcome::Evicted(detail);
+                }
+                return ReattachOutcome::Dead(detail);
             }
             Err(SandboxError::NotFound(_)) => {
-                return ReattachOutcome::Dead("sandbox no longer exists".to_owned());
+                return ReattachOutcome::Evicted("sandbox no longer exists".to_owned());
             }
             Err(error) => {
                 return ReattachOutcome::Retryable(format!("sandbox status check failed: {error}"));
@@ -5023,6 +5228,18 @@ async fn fail_detached_execution(
     detail: &str,
 ) {
     let error = format!("sandbox stdout closed before terminal output; {detail}");
+    fail_detached_execution_with(ctx, thread_key, sandbox_id, execution_id, error).await;
+}
+
+/// Fail a detached execution with an explicit human-facing error, used when the
+/// raw pump detail would otherwise be surfaced to the requester verbatim.
+async fn fail_detached_execution_with(
+    ctx: &RuntimeContext,
+    thread_key: &ThreadKey,
+    sandbox_id: &str,
+    execution_id: &str,
+    error: String,
+) {
     if let Err(record_error) = record_terminal_output(
         ctx,
         thread_key,
@@ -11328,6 +11545,132 @@ mod adoption_tests {
             Some("Recovered from pod logs.")
         );
         assert_eq!(backend.opens(), 1);
+        reset_test_store(&store).await;
+    }
+
+    /// A node replacement evicted the sandbox after the harness had produced
+    /// output (a tool call, an answer delta). The turn cannot be replayed
+    /// without repeating side effects, so it fails with a requester-facing
+    /// message instead of the raw pump error, and it is not replayed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evicted_sandbox_after_output_fails_with_requester_message() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:evicted-late-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-gone"), true).await;
+        store
+            .append_event(
+                &thread_key,
+                Some(&execution_id),
+                SESSION_OUTPUT_LINE_EVENT,
+                json!({"line": "{\"type\":\"item.started\",\"item\":{\"type\":\"mcpToolCall\"}}"}),
+            )
+            .await
+            .expect("persisted output line");
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+
+        let runtime = runtime_with(&store, backend.clone());
+        claim_test_stdout_owner(&runtime, &execution_id).await;
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-gone")
+            .await
+            .expect("open initial pipe");
+        backend.set_status(SandboxStatus::Gone);
+        drop(stdout);
+
+        wait_for_event(&store, &thread_key, "session.execution_failed").await;
+        let all = events(&store, &thread_key).await;
+        let failed = all
+            .iter()
+            .find(|event| event.event_type == "session.execution_failed")
+            .expect("failed event");
+        assert_eq!(
+            failed.payload["error"].as_str(),
+            Some(SANDBOX_EVICTED_REQUESTER_MESSAGE)
+        );
+        assert!(
+            !all.iter()
+                .any(|event| event.event_type == SESSION_EXECUTION_EVICTED_RETRY_EVENT),
+            "an execution with persisted output must not be replayed"
+        );
+        let execution = store
+            .latest_execution_for_thread(&thread_key)
+            .await
+            .unwrap()
+            .expect("execution row");
+        assert_eq!(execution.execution_id, execution_id);
+        assert_eq!(execution.status, ExecutionStatus::Failed);
+        assert_eq!(
+            execution.error.as_deref(),
+            Some(SANDBOX_EVICTED_REQUESTER_MESSAGE)
+        );
+        assert_eq!(backend.opens(), 1);
+        assert!(backend.created_specs().is_empty());
+        reset_test_store(&store).await;
+    }
+
+    /// A node replacement evicted the sandbox before the harness produced any
+    /// output. The persisted request is replayed once on a fresh sandbox, and
+    /// the durable once-only marker is written exactly once so a second loss
+    /// cannot replay again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evicted_sandbox_before_output_is_replayed_once() {
+        use tokio::io::AsyncReadExt;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:evicted-early-{}", uuid::Uuid::new_v4())).unwrap();
+        // Queued rows carry the persisted request; mark it running like the live
+        // dispatch does.
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-gone"), false).await;
+        store
+            .mark_execution_running(&execution_id)
+            .await
+            .expect("mark running");
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let (replay_io, _replay_stdout, mut replay_stdin) = mock_io();
+        backend.push_io(replay_io).await;
+
+        let runtime = runtime_with(&store, backend.clone());
+        claim_test_stdout_owner(&runtime, &execution_id).await;
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-gone")
+            .await
+            .expect("open initial pipe");
+        backend.set_status(SandboxStatus::Gone);
+        drop(stdout);
+
+        wait_for_event(&store, &thread_key, SESSION_EXECUTION_EVICTED_RETRY_EVENT).await;
+        // The persisted input reaches the new sandbox's stdin.
+        let mut replayed = vec![0_u8; 4096];
+        let read = tokio::time::timeout(Duration::from_secs(5), replay_stdin.read(&mut replayed))
+            .await
+            .expect("replayed input within timeout")
+            .expect("read replayed input");
+        assert!(
+            String::from_utf8_lossy(&replayed[..read]).contains("recover me"),
+            "expected the persisted request to be replayed"
+        );
+        let session = store.get_session(&thread_key).await.unwrap();
+        assert_eq!(session.sandbox_id.as_deref(), Some("mock-sbx"));
+        assert_eq!(backend.created_specs().len(), 1, "replayed exactly once");
+        let retry_events = events(&store, &thread_key)
+            .await
+            .into_iter()
+            .filter(|event| event.event_type == SESSION_EXECUTION_EVICTED_RETRY_EVENT)
+            .count();
+        assert_eq!(retry_events, 1, "the once-only marker must be written once");
         reset_test_store(&store).await;
     }
 
