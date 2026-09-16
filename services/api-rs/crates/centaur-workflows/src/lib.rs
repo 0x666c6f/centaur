@@ -3464,7 +3464,8 @@ async fn handle_python_context_request(
             )
             .await
             {
-                Ok(Ok(task)) => Ok(task.unwrap_or(Value::Null)),
+                Ok(Ok(Some(task))) => serde_json::to_value(task).map_err(|error| error.to_string()),
+                Ok(Ok(None)) => Ok(Value::Null),
                 Ok(Err(error)) => Err(error.to_string()),
                 Err(_) => Err("scheduled task lookup timed out".to_owned()),
             }

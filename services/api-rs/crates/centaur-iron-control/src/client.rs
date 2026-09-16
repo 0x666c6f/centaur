@@ -16,8 +16,8 @@ use crate::models::{
     AwsAuthSecretInput, BrokerCredentialInput, BrokerCredentialRecord, DataEnvelope,
     EffectiveConfig, GcpAuthSecretInput, GcpIdTokenSecretInput, Grant, GrantSecret, Grantee,
     HmacSecretInput, IdentityInput, OAuthTokenSecretInput, PgDsnSecretInput, Principal,
-    PrincipalInput, Proxy, ProxyInput, Role, SecretRecord, SlackChannelPermissionInput,
-    StaticSecretInput,
+    PrincipalInput, Proxy, ProxyInput, Role, ScheduledTask, SecretRecord,
+    SlackChannelPermissionInput, StaticSecretInput,
 };
 
 const API_PREFIX: &str = "/api/v1";
@@ -148,7 +148,7 @@ impl IronControlClient {
     }
 
     /// Fetch current scheduled-task state. Deleted tasks return `None`.
-    pub async fn get_scheduled_task(&self, task_id: &str) -> Result<Option<Value>> {
+    pub async fn get_scheduled_task(&self, task_id: &str) -> Result<Option<ScheduledTask>> {
         let path = format!(
             "{API_PREFIX}/scheduled_tasks/{}",
             urlencoding::encode(task_id)
@@ -624,7 +624,10 @@ mod tests {
         );
         let server = tokio::spawn(async move {
             for (status, body) in [
-                ("200 OK", r#"{"data":{"id":"tsk_123","enabled":true}}"#),
+                (
+                    "200 OK",
+                    r#"{"data":{"id":"tsk_123","enabled":true,"author_active":true,"principal":"console-user-author","delivery_channel":"C0123456789","delivery_allowed":true}}"#,
+                ),
                 ("404 Not Found", r#"{"error":{"message":"not found"}}"#),
             ] {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -659,7 +662,8 @@ mod tests {
         });
 
         let task = client.get_scheduled_task("tsk_123").await.unwrap().unwrap();
-        assert_eq!(task["enabled"], true);
+        assert_eq!(task.id, "tsk_123");
+        assert!(task.enabled);
         assert!(
             client
                 .get_scheduled_task("tsk_123")
