@@ -6,7 +6,7 @@
 //! wraps the body in the ``{ "data": ... }`` envelope, sends, and unwraps the
 //! response ``data`` field.
 
-use reqwest::{Client as HttpClient, Method, Response};
+use reqwest::{Client as HttpClient, Method, Response, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -145,6 +145,19 @@ impl IronControlClient {
         let path = resource_path("principals", "prn_", principal, "");
         let resp = self.send(Method::GET, &path, None::<&Value>).await?;
         decode_data(resp, Method::GET, &path).await
+    }
+
+    /// Fetch current scheduled-task state. Deleted tasks return `None`.
+    pub async fn get_scheduled_task(&self, task_id: &str) -> Result<Option<Value>> {
+        let path = format!(
+            "{API_PREFIX}/scheduled_tasks/{}",
+            urlencoding::encode(task_id)
+        );
+        let resp = self.send(Method::GET, &path, None::<&Value>).await?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        decode_data(resp, Method::GET, &path).await.map(Some)
     }
 
     /// Assign a role (by OID) to a principal (by OID).
@@ -600,6 +613,62 @@ async fn ensure_success(resp: Response, method: Method, path: &str) -> Result<Re
 mod tests {
     use super::*;
     use crate::models::{InjectConfig, ReplaceConfig, RequestRule, SecretSource};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn scheduled_task_lookup_returns_state_or_none() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = IronControlClient::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            "test-key",
+        );
+        let server = tokio::spawn(async move {
+            for (status, body) in [
+                ("200 OK", r#"{"data":{"id":"tsk_123","enabled":true}}"#),
+                ("404 Not Found", r#"{"error":{"message":"not found"}}"#),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0; 1024];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buf[..n]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.starts_with("GET /api/v1/scheduled_tasks/tsk_123 HTTP/1.1"));
+                assert!(
+                    request
+                        .to_lowercase()
+                        .contains("authorization: bearer test-key")
+                );
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let task = client.get_scheduled_task("tsk_123").await.unwrap().unwrap();
+        assert_eq!(task["enabled"], true);
+        assert!(
+            client
+                .get_scheduled_task("tsk_123")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        server.await.unwrap();
+    }
 
     #[test]
     fn grant_body_principal_static() {

@@ -137,12 +137,43 @@ def _prompt_for_slack(prompt: str) -> str:
     )
 
 
+def _task_is_executable(
+    task: Any,
+    *,
+    task_id: str,
+    principal: str,
+    channel: str,
+) -> bool:
+    return (
+        isinstance(task, dict)
+        and task.get("id") == task_id
+        and task.get("enabled") is True
+        and task.get("author_active") is True
+        and task.get("principal") == principal
+        and task.get("delivery_channel") == channel
+        and task.get("delivery_allowed") is True
+    )
+
+
 async def handler(params: Any, ctx: Any) -> dict[str, Any]:
     prompt = _required_string(params, "prompt")
     principal = _required_string(params, "principal")
     channel = _required_string(params, "channel")
     scheduled_task_id = _required_string(params, "scheduled_task_id")
     slack_user_id = str(params.get("slack_user_id") or "").strip()
+
+    task = await ctx.get_scheduled_task(scheduled_task_id)
+    if not _task_is_executable(
+        task,
+        task_id=scheduled_task_id,
+        principal=principal,
+        channel=channel,
+    ):
+        return {
+            "status": "skipped",
+            "reason": "scheduled_task_not_executable",
+            "scheduled_task_id": scheduled_task_id,
+        }
 
     result = await ctx.agent_turn(
         _prompt_for_slack(prompt),
@@ -155,6 +186,21 @@ async def handler(params: Any, ctx: Any) -> dict[str, Any]:
     response_text = str(result.get("result_text") or "").strip()
     if not response_text:
         response_text = "The task completed without a text response."
+
+    task = await ctx.get_scheduled_task(scheduled_task_id)
+    if not _task_is_executable(
+        task,
+        task_id=scheduled_task_id,
+        principal=principal,
+        channel=channel,
+    ):
+        return {
+            "status": "skipped",
+            "reason": "scheduled_task_not_executable",
+            "scheduled_task_id": scheduled_task_id,
+            "agent_result": result,
+        }
+
     delivery = await _deliver_to_slack(
         ctx,
         channel,

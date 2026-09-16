@@ -14,14 +14,32 @@ class FakeContext:
         result_text: str = "Daily summary",
         output_lines=None,
         slack_response_channel=None,
+        scheduled_tasks=None,
+        scheduled_task_channel: str = "C0123456789",
     ) -> None:
         self.result_text = result_text
         self.output_lines = output_lines or []
         self.slack_response_channel = slack_response_channel
+        self.scheduled_task_channel = scheduled_task_channel
+        self.scheduled_tasks = list(scheduled_tasks or [])
+        self.scheduled_task_calls = []
         self.agent_calls = []
         self.step_calls = []
         self.step_results = {}
         self.slack_calls = []
+
+    async def get_scheduled_task(self, task_id):
+        self.scheduled_task_calls.append(task_id)
+        if self.scheduled_tasks:
+            return self.scheduled_tasks.pop(0)
+        return {
+            "id": task_id,
+            "enabled": True,
+            "author_active": True,
+            "principal": "console-user-author",
+            "delivery_channel": self.scheduled_task_channel,
+            "delivery_allowed": True,
+        }
 
     async def agent_turn(self, prompt, **kwargs):
         self.agent_calls.append((prompt, kwargs))
@@ -108,6 +126,59 @@ def test_handler_runs_one_scoped_agent_turn_and_delivers_its_text():
     assert result["delivery"]["ts"] == "123.1"
 
 
+def test_handler_skips_an_ineligible_task_before_starting_an_agent():
+    context = FakeContext(scheduled_tasks=[None])
+
+    result = asyncio.run(
+        console_workflow.handler(
+            {
+                "prompt": "Summarize open incidents",
+                "principal": "console-user-author",
+                "channel": "C0123456789",
+                "scheduled_task_id": "tsk_123",
+            },
+            context,
+        )
+    )
+
+    assert result == {
+        "status": "skipped",
+        "reason": "scheduled_task_not_executable",
+        "scheduled_task_id": "tsk_123",
+    }
+    assert context.agent_calls == []
+    assert context.slack_calls == []
+
+
+def test_handler_rechecks_eligibility_before_slack_delivery():
+    executable = {
+        "id": "tsk_123",
+        "enabled": True,
+        "author_active": True,
+        "principal": "console-user-author",
+        "delivery_channel": "C0123456789",
+        "delivery_allowed": True,
+    }
+    context = FakeContext(scheduled_tasks=[executable, {**executable, "enabled": False}])
+
+    result = asyncio.run(
+        console_workflow.handler(
+            {
+                "prompt": "Summarize open incidents",
+                "principal": "console-user-author",
+                "channel": "C0123456789",
+                "scheduled_task_id": "tsk_123",
+            },
+            context,
+        )
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "scheduled_task_not_executable"
+    assert len(context.agent_calls) == 1
+    assert context.slack_calls == []
+
+
 def test_handler_treats_recurring_language_as_an_instruction_to_execute_now():
     context = FakeContext()
     task = (
@@ -187,7 +258,11 @@ def test_handler_threads_and_truncates_long_channel_results():
 
 def test_handler_posts_long_dm_results_as_replies_to_the_first_message():
     response_text = "a" * (console_workflow.SLACK_MESSAGE_CHUNK_MAX_LENGTH * 2 + 25)
-    context = FakeContext(result_text=response_text, slack_response_channel="D0123456789")
+    context = FakeContext(
+        result_text=response_text,
+        slack_response_channel="D0123456789",
+        scheduled_task_channel="U0123456789",
+    )
     params = {
         "prompt": "Summarize open incidents",
         "principal": "console-user-author",

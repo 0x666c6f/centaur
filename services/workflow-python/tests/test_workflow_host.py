@@ -63,6 +63,8 @@ class RequestRpc(FakeRpc):
                 "args": payload["args"],
                 "via": "rpc",
             }
+        if message_type == "ctx.scheduled_task.get":
+            return {"id": payload["task_id"], "enabled": True}
         if message_type == "ctx.agent_turn":
             return payload["args"]
         if message_type == "ctx.run_agents":
@@ -433,6 +435,24 @@ class WorkflowHostTests(unittest.TestCase):
                     "idempotency_key": "company-context:slack-thread:42",
                 }
             ],
+        )
+
+    def test_get_scheduled_task_uses_context_rpc(self) -> None:
+        host = load_workflow_host()
+        rpc = RequestRpc()
+        ctx = host.WorkflowContext(
+            rpc,
+            run_id="run-1",
+            task_id="task-1",
+            workflow_name="scheduled",
+        )
+
+        result = asyncio.run(ctx.get_scheduled_task("tsk_123"))
+
+        self.assertEqual(result, {"id": "tsk_123", "enabled": True})
+        self.assertEqual(
+            rpc.requests,
+            [{"type": "ctx.scheduled_task.get", "task_id": "tsk_123"}],
         )
 
     def test_post_to_slack_sends_optional_custom_identity(self) -> None:

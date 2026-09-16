@@ -51,6 +51,7 @@ const PYTHON_HOST_INTERPRETER_ENV: &str = "PYTHON_WORKFLOW_HOST_PYTHON";
 const WORKFLOW_TOOL_API_URL_ENV: &str = "WORKFLOW_TOOL_API_URL";
 const DEFAULT_AGENT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_AGENT_MAX_DURATION_MS: u64 = 30 * 60 * 1_000;
+const CONSOLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_AGENT_BATCH_CONCURRENCY: usize = 4;
 const MAX_AGENT_BATCH_CONCURRENCY: usize = 16;
 const MAX_AGENT_BATCH_SIZE: usize = 32;
@@ -218,6 +219,7 @@ struct WorkflowQueueClients {
     slack_live: Client,
     etl: Client,
     etl_backfill: Client,
+    console: IronControlClient,
 }
 
 #[derive(Clone)]
@@ -612,6 +614,7 @@ impl WorkflowRuntime {
             slack_live: slack_live_client.clone(),
             etl: etl_client.clone(),
             etl_backfill: etl_backfill_client.clone(),
+            console: workflow_principal_registrar.client.clone(),
         };
 
         let discovery = discover_python_workflow_metadata().await?;
@@ -3451,6 +3454,19 @@ async fn handle_python_context_request(
                 Ok(value) => Ok(value),
                 Err(absurd::Error::Suspend) => return Err(WorkflowRuntimeError::Suspend),
                 Err(error) => Err(error.to_string()),
+            }
+        }
+        Some("ctx.scheduled_task.get") => {
+            let task_id = required_python_string(message, "task_id", "ctx.scheduled_task.get")?;
+            match tokio::time::timeout(
+                CONSOLE_REQUEST_TIMEOUT,
+                workflow_clients.console.get_scheduled_task(task_id),
+            )
+            .await
+            {
+                Ok(Ok(task)) => Ok(task.unwrap_or(Value::Null)),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err("scheduled task lookup timed out".to_owned()),
             }
         }
         Some("ctx.agent_turn") => {
