@@ -725,6 +725,22 @@ struct SandboxArgs {
         env = "SESSION_SANDBOX_NODE_SELECTOR"
     )]
     node_selector_json: Option<String>,
+    /// Extra metadata annotations for sandbox **and** iron-proxy pods, as a
+    /// JSON object of string key/value pairs. The chart renders
+    /// `sandbox.podAnnotations` into this. Like the node selector, these reach
+    /// the pods through the control plane rather than the chart, because api-rs
+    /// creates those pods at runtime and nothing the chart renders can reach
+    /// them.
+    ///
+    /// The motivating case is `karpenter.sh/do-not-disrupt: "true"` (or the
+    /// cluster-autoscaler equivalent) so a node consolidation or drift
+    /// replacement does not evict a pod while it is serving a turn. Malformed
+    /// JSON is a hard error rather than being silently ignored.
+    #[arg(
+        long = "session-sandbox-pod-annotations",
+        env = "SESSION_SANDBOX_POD_ANNOTATIONS"
+    )]
+    pod_annotations_json: Option<String>,
     /// Sandbox/proxy pod tolerations as a JSON array in the Kubernetes
     /// toleration shape. The chart renders `sandbox.tolerations` into this.
     #[arg(
@@ -1214,6 +1230,25 @@ impl SandboxArgs {
         })
     }
 
+    /// `SESSION_SANDBOX_POD_ANNOTATIONS` parsed as a JSON object of annotation
+    /// key/value pairs. Empty or unset yields no annotations.
+    fn pod_annotations(&self) -> Result<BTreeMap<String, String>, ServerError> {
+        let Some(raw) = self
+            .pod_annotations_json
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        else {
+            return Ok(BTreeMap::new());
+        };
+        serde_json::from_str::<BTreeMap<String, String>>(raw).map_err(|error| {
+            ServerError::UnsupportedConfig(format!(
+                "SESSION_SANDBOX_POD_ANNOTATIONS must be a JSON object of string \
+                 key/value pairs: {error}"
+            ))
+        })
+    }
+
     /// `SESSION_SANDBOX_TOLERATIONS` parsed as a JSON array of Kubernetes
     /// tolerations. Invalid input fails startup for the same reason as
     /// [`Self::node_selector`].
@@ -1554,6 +1589,7 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
             .map(str::to_owned)
             .collect();
         config.node_selector = args.node_selector()?;
+        config.pod_annotations = args.pod_annotations()?;
         config.tolerations = args.tolerations()?;
         config.runtime_class_name = args
             .runtime_class_name
@@ -3036,12 +3072,21 @@ mod tests {
             "centaur-sandbox",
             "--session-sandbox-priority-class-name",
             "centaur-sandbox",
+            "--session-sandbox-pod-annotations",
+            r#"{"karpenter.sh/do-not-disrupt":"true"}"#,
         ])
         .unwrap();
 
         assert_eq!(
             args.sandbox.node_selector().unwrap().get("workload"),
             Some(&"centaur-sandbox".to_owned())
+        );
+        assert_eq!(
+            args.sandbox
+                .pod_annotations()
+                .unwrap()
+                .get("karpenter.sh/do-not-disrupt"),
+            Some(&"true".to_owned())
         );
         assert_eq!(args.sandbox.tolerations().unwrap().len(), 1);
         assert_eq!(args.sandbox.runtime_class_name.as_deref(), Some("gvisor"));
@@ -3065,6 +3110,7 @@ mod tests {
         .unwrap();
 
         assert!(args.sandbox.node_selector().unwrap().is_empty());
+        assert!(args.sandbox.pod_annotations().unwrap().is_empty());
         assert!(args.sandbox.tolerations().unwrap().is_empty());
         assert!(args.sandbox.service_account_name.is_none());
         assert!(args.sandbox.priority_class_name.is_none());
@@ -3094,6 +3140,41 @@ mod tests {
         ])
         .unwrap();
         assert!(args.sandbox.tolerations().is_err());
+    }
+
+    #[test]
+    fn pod_annotations_parse_string_map() {
+        let parse = |raw: &str| {
+            Args::try_parse_from([
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+                "--session-sandbox-pod-annotations",
+                raw,
+            ])
+            .unwrap()
+            .sandbox
+            .pod_annotations()
+        };
+
+        assert!(parse("not-json").is_err());
+        assert!(parse(r#"["karpenter.sh/do-not-disrupt"]"#).is_err());
+        assert!(parse(r#"{"karpenter.sh/do-not-disrupt": true}"#).is_err());
+
+        assert!(parse("").unwrap().is_empty());
+        assert!(parse("{}").unwrap().is_empty());
+        let multiline = "line\nbreak";
+        let large = "v".repeat(4097);
+        let raw = serde_json::json!({
+            "karpenter.sh/do-not-disrupt": "true",
+            "example.com/multiline": multiline,
+            "example.com/large": large,
+        })
+        .to_string();
+        let parsed = parse(&raw).unwrap();
+        assert_eq!(parsed["karpenter.sh/do-not-disrupt"], "true");
+        assert_eq!(parsed["example.com/multiline"], multiline);
+        assert_eq!(parsed["example.com/large"], large);
     }
 
     /// The only test that mutates the process-level OTLP env keys: keeps all
