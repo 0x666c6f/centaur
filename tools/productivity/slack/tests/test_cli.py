@@ -550,10 +550,13 @@ def test_help_explains_channel_and_dm_access_paths() -> None:
     result = CliRunner().invoke(app, ["--help"])
 
     assert result.exit_code == 0
-    assert "proxy-backed commands" in result.output
-    assert "Slack channels" in result.output
-    assert "Use commands ending in" in result.output
-    assert "Slack DMs" in result.output
+    assert "two access paths" in result.output
+    assert "Proxied commands omit" in result.output
+    assert "Slack channel chat surfaces" in result.output
+    assert "Direct commands end" in result.output
+    assert "actual user token" in result.output
+    assert "including in Slack DM chat surfaces and MCP" in result.output
+    assert "surface and credential context" in result.output
     assert "search-direct" in result.output
 
 
