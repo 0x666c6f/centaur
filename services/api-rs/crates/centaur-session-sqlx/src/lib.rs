@@ -634,38 +634,40 @@ impl PgSessionStore {
         row.try_into().map(Some)
     }
 
-    /// Hand a running execution this control plane owns back to the queue in
-    /// one statement (status and stdout lease together), so an eviction replay
-    /// never leaves a running row without an owner. `started_at` is kept so the
-    /// replay runs against the original deadline. Returns the requeued row, or
-    /// `None` when the execution is no longer running or no longer owned by
-    /// `owner_id` (another control plane took it over).
-    pub async fn requeue_execution_if_running_and_stdout_owner(
+    /// Returns whether a sandbox is durably known to be idle and safe for an
+    /// unforced drain. Unknown and partially assigned sandboxes fail closed.
+    pub async fn sandbox_is_idle_for_drain(
         &self,
-        execution_id: &str,
-        owner_id: &str,
-    ) -> Result<Option<SessionExecution>, SessionStoreError> {
-        let row = sqlx::query_as::<_, SessionExecutionRow>(
+        sandbox_id: &str,
+    ) -> Result<bool, SessionStoreError> {
+        let idle = sqlx::query_scalar::<_, bool>(
             r#"
-            update session_executions
-            set status = $3,
-                stdout_owner_id = null,
-                stdout_owner_lease_expires_at = null,
-                updated_at = now()
-            where execution_id = $1
-              and status = $4
-              and stdout_owner_id = $2
-            returning execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            select exists (
+                select 1
+                from sessions
+                where sessions.sandbox_id = $1
+                  and not exists (
+                      select 1
+                      from session_executions
+                      where session_executions.thread_key = sessions.thread_key
+                        and session_executions.status in ($2, $3)
+                  )
+
+                union all
+
+                select 1
+                from session_warm_sandboxes
+                where sandbox_id = $1 and status = 'ready'
+            )
             "#,
         )
-        .bind(execution_id)
-        .bind(owner_id)
+        .bind(sandbox_id)
         .bind(ExecutionStatus::Queued.as_ref())
         .bind(ExecutionStatus::Running.as_ref())
-        .fetch_optional(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
 
-        row.map(TryInto::try_into).transpose()
+        Ok(idle)
     }
 
     pub async fn claim_stdout_owner(

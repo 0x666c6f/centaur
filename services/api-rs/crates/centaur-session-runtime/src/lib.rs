@@ -45,7 +45,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     io,
-    sync::Mutex,
+    sync::{Mutex, RwLock},
     time::{Instant, Interval, MissedTickBehavior, interval_at, sleep, timeout},
 };
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
@@ -61,12 +61,7 @@ use title_generator::{
 
 pub const SESSION_OUTPUT_LINE_EVENT: &str = "session.output.line";
 pub const SESSION_FIRST_TOKEN_EVENT: &str = "session.first_token";
-/// Durable once-only marker for the eviction replay: an execution whose sandbox
-/// was replaced before it produced any output is replayed on a fresh sandbox
-/// exactly once; a second loss fails with the requester-facing message.
-pub const SESSION_EXECUTION_EVICTED_RETRY_EVENT: &str = "session.execution_evicted_retry";
-/// Requester-facing failure message used when a sandbox is replaced mid-turn
-/// and the turn cannot be safely replayed.
+/// Requester-facing failure message used when a sandbox is replaced mid-turn.
 const SANDBOX_EVICTED_REQUESTER_MESSAGE: &str =
     "The sandbox running this response was replaced before it finished; please re-ask.";
 
@@ -116,12 +111,14 @@ pub trait SessionPrincipalRegistrar: Send + Sync {
         &self,
         thread_key: &str,
         metadata: Option<&Value>,
+        create_if_missing: bool,
     ) -> Result<Principal, IronControlError>;
 
     async fn register_requester(
         &self,
         thread_key: &str,
         metadata: Option<&Value>,
+        create_if_missing: bool,
     ) -> Result<Option<Principal>, IronControlError>;
 
     async fn get_principal(&self, principal: &str) -> Result<Principal, IronControlError>;
@@ -133,20 +130,35 @@ impl SessionPrincipalRegistrar for SessionRegistrar {
         &self,
         thread_key: &str,
         metadata: Option<&Value>,
+        create_if_missing: bool,
     ) -> Result<Principal, IronControlError> {
-        SessionRegistrar::register_session(self, thread_key, metadata).await
+        SessionRegistrar::resolve_session(self, thread_key, metadata, create_if_missing).await
     }
 
     async fn register_requester(
         &self,
         thread_key: &str,
         metadata: Option<&Value>,
+        create_if_missing: bool,
     ) -> Result<Option<Principal>, IronControlError> {
-        SessionRegistrar::register_requester(self, thread_key, metadata).await
+        SessionRegistrar::resolve_requester(self, thread_key, metadata, create_if_missing).await
     }
 
     async fn get_principal(&self, principal: &str) -> Result<Principal, IronControlError> {
         SessionRegistrar::get_principal(self, principal).await
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SessionPrincipalAdmission {
+    #[default]
+    Automatic,
+    Preapproved,
+}
+
+impl SessionPrincipalAdmission {
+    fn create_if_missing(self) -> bool {
+        matches!(self, Self::Automatic)
     }
 }
 
@@ -159,6 +171,7 @@ pub struct SessionRuntime {
     tool_host_call_locks: ToolHostCallLocks,
     execution_spans: ExecutionSpanRegistry,
     iron_control: Arc<dyn SessionPrincipalRegistrar>,
+    session_principal_admission: SessionPrincipalAdmission,
     warm_pool: Option<Arc<WarmPoolManager>>,
     personas: Option<Arc<PersonaRegistry>>,
     session_title_generator: Option<SessionTitleGenerator>,
@@ -170,6 +183,10 @@ pub struct SessionRuntime {
     /// so an execution cannot start on a control plane that is about to
     /// exit and release its leases.
     shutting_down: Arc<AtomicBool>,
+    /// Serializes drains against the short execution admission window. A
+    /// drain takes the write side; execution paths hold a read guard until
+    /// their active row and stdout ownership are durable.
+    execution_admission: Arc<RwLock<()>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -364,6 +381,9 @@ pub struct CreateOrGetSessionOutcome {
 pub struct DrainReport {
     pub stopped: Vec<String>,
     pub failed: Vec<DrainFailure>,
+    /// Sandboxes left running because they were active or could not be proven
+    /// idle. Only populated when the drain is not forced.
+    pub busy: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -977,6 +997,7 @@ impl SessionRuntime {
             tool_host_call_locks: Arc::new(DashMap::new()),
             execution_spans: Arc::new(Mutex::new(HashMap::new())),
             iron_control: Arc::new(iron_control),
+            session_principal_admission: SessionPrincipalAdmission::default(),
             warm_pool: None,
             personas: None,
             session_title_generator: None,
@@ -985,7 +1006,16 @@ impl SessionRuntime {
             capacity: None,
             stdout_owner_id: format!("api-rs-{}", uuid::Uuid::new_v4().simple()),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            execution_admission: Arc::new(RwLock::new(())),
         }
+    }
+
+    pub fn with_session_principal_admission(
+        mut self,
+        admission: SessionPrincipalAdmission,
+    ) -> Self {
+        self.session_principal_admission = admission;
+        self
     }
 
     pub fn with_session_title_generator<F, Fut>(mut self, generator: F) -> Self
@@ -1577,7 +1607,7 @@ impl SessionRuntime {
         let metadata = tool_host_session_metadata(principal_id, None, None);
         let principal = self
             .iron_control
-            .register_session(thread_key.as_str(), Some(&metadata))
+            .register_session(thread_key.as_str(), Some(&metadata), true)
             .await?;
         Ok(principal.id)
     }
@@ -1671,6 +1701,8 @@ impl SessionRuntime {
         self
     }
 
+    /// Create or load an internal session, automatically provisioning its
+    /// derived principal when no explicit principal is supplied.
     pub async fn create_or_get_session(
         &self,
         thread_key: &ThreadKey,
@@ -1679,20 +1711,44 @@ impl SessionRuntime {
         metadata: Option<Value>,
         on_harness_conflict: HarnessConflictPolicy,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
-        self.create_or_get_session_with_principal(
+        self.create_or_get_session_with_principal_admission(
             thread_key,
             harness_type,
             persona_id,
             metadata,
             on_harness_conflict,
             None,
+            SessionPrincipalAdmission::Automatic,
         )
         .await
     }
 
-    /// Create or load a session and bind it to an existing iron-control
-    /// principal selected by foreign ID. When no foreign ID is supplied, the
-    /// session keeps the normal principal derived from its thread key.
+    /// Create or load an ingress session using the deployment's principal
+    /// admission policy. HTTP chat ingresses use this path; internal workflows
+    /// use [`Self::create_or_get_session`] or explicitly select a principal.
+    pub async fn create_or_get_admitted_session(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        on_harness_conflict: HarnessConflictPolicy,
+    ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        self.create_or_get_session_with_principal_admission(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            on_harness_conflict,
+            None,
+            self.session_principal_admission,
+        )
+        .await
+    }
+
+    /// Create or load an internal session and bind it to an existing
+    /// iron-control principal selected by foreign ID. When no foreign ID is
+    /// supplied, its derived principal is provisioned automatically.
     pub async fn create_or_get_session_with_principal(
         &self,
         thread_key: &ThreadKey,
@@ -1701,6 +1757,29 @@ impl SessionRuntime {
         metadata: Option<Value>,
         on_harness_conflict: HarnessConflictPolicy,
         principal_foreign_id: Option<&str>,
+    ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        self.create_or_get_session_with_principal_admission(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            on_harness_conflict,
+            principal_foreign_id,
+            SessionPrincipalAdmission::Automatic,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_or_get_session_with_principal_admission(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        on_harness_conflict: HarnessConflictPolicy,
+        principal_foreign_id: Option<&str>,
+        admission: SessionPrincipalAdmission,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
         let principal_foreign_id = match principal_foreign_id {
             Some(foreign_id) if foreign_id.trim().is_empty() => {
@@ -1735,7 +1814,11 @@ impl SessionRuntime {
                 Some(foreign_id) => self.iron_control.get_principal(foreign_id).await?,
                 None => {
                     self.iron_control
-                        .register_session(thread_key.as_str(), Some(&session_metadata))
+                        .register_session(
+                            thread_key.as_str(),
+                            Some(&session_metadata),
+                            admission.create_if_missing(),
+                        )
                         .await?
                 }
             };
@@ -2012,7 +2095,15 @@ impl SessionRuntime {
     /// each sandbox is stopped independently so one failure does not abort the
     /// rest, and the [`DrainReport`] records which were stopped and which
     /// failed so the caller can surface partial failure.
-    pub async fn drain(&self) -> Result<DrainReport, SessionRuntimeError> {
+    ///
+    /// Without `force`, only sandboxes durably known to be idle are stopped.
+    /// Active, provisioning, and otherwise unknown sandboxes are left running
+    /// and reported as `busy`. With `force`, every non-terminal sandbox is
+    /// stopped regardless.
+    pub async fn drain(&self, force: bool) -> Result<DrainReport, SessionRuntimeError> {
+        // Block new execution admission while each sandbox's durable state is
+        // checked and acted on, closing the idle-check/stop race in this runtime.
+        let _admission = self.execution_admission.write().await;
         let observed = self.sandbox_runtime.manager.list_observed().await?;
         let mut report = DrainReport::default();
         for sandbox in observed {
@@ -2020,6 +2111,10 @@ impl SessionRuntime {
                 continue;
             }
             let id = sandbox.id.as_str().to_owned();
+            if !force && !self.store.sandbox_is_idle_for_drain(&id).await? {
+                report.busy.push(id);
+                continue;
+            }
             match self.sandbox_runtime.manager.stop(&sandbox.id).await {
                 Ok(()) => {
                     self.sandbox_pipes.remove(&id);
@@ -2195,6 +2290,7 @@ impl SessionRuntime {
     ) -> Result<SessionExecutionAttempt, SessionExecutionAttemptError> {
         let mut execution_id = persisted_execution_id.map(str::to_owned);
         let mut correlation_sandbox_id = None;
+        let admission = self.execution_admission.read().await;
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err(SessionExecutionAttemptError::new(
                 execution_id,
@@ -2316,6 +2412,7 @@ impl SessionRuntime {
                     .await;
                 return Err(error);
             }
+            drop(admission);
             let execution_trace_span = info_span!(
                 parent: None,
                 "centaur.api_rs.session.execution",
@@ -2497,6 +2594,7 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         input: ExecuteSessionInput,
     ) -> Result<SessionExecution, SessionRuntimeError> {
+        let _admission = self.execution_admission.read().await;
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err(SessionRuntimeError::ShuttingDown);
         }
@@ -2567,179 +2665,6 @@ impl SessionRuntime {
                 );
             }
         });
-    }
-
-    /// The stdout pump found the sandbox replaced mid-turn (eviction, node
-    /// replacement). Replay the turn on a fresh sandbox when the harness had
-    /// not produced any output yet; otherwise fail it with a requester-facing
-    /// message instead of the raw pump error.
-    async fn handle_evicted_execution(
-        &self,
-        ctx: &RuntimeContext,
-        thread_key: &ThreadKey,
-        sandbox_id: &str,
-        execution_id: &str,
-        detail: &str,
-    ) {
-        warn!(
-            component = COMPONENT_SESSION_RUNTIME,
-            event = "session_execution_sandbox_evicted",
-            thread_key = %thread_key,
-            execution_id,
-            sandbox_id,
-            detail,
-            "sandbox replaced before the turn finished"
-        );
-        match self
-            .retry_evicted_execution(thread_key, sandbox_id, execution_id)
-            .await
-        {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(error) => warn!(
-                component = COMPONENT_SESSION_RUNTIME,
-                event = "session_execution_evicted_retry_failed",
-                thread_key = %thread_key,
-                execution_id,
-                sandbox_id,
-                %error,
-                "failed to replay evicted execution; failing it"
-            ),
-        }
-        fail_detached_execution_with(
-            ctx,
-            thread_key,
-            sandbox_id,
-            execution_id,
-            SANDBOX_EVICTED_REQUESTER_MESSAGE.to_owned(),
-        )
-        .await;
-    }
-
-    /// Returns `Ok(true)` when the execution was handed back to the queue and
-    /// re-driven on a new sandbox; `Ok(false)` when it must fail instead (any
-    /// output already persisted, already retried once, no persisted request, or
-    /// the row is no longer ours).
-    ///
-    /// The replay gate is "no `session.output.line` at all", not "no answer
-    /// token": tool calls run before the answer and a replayed side effect (a
-    /// created issue, a posted message) would apply twice. Output rows are
-    /// committed before any marker, so the gate cannot be fooled.
-    async fn retry_evicted_execution(
-        &self,
-        thread_key: &ThreadKey,
-        sandbox_id: &str,
-        execution_id: &str,
-    ) -> Result<bool, SessionRuntimeError> {
-        // Only the current stdout owner may spend the retry allowance: a stale
-        // pump whose lease another control plane took over must not detach the
-        // sandbox or append the marker. Claim before reading the gates so no
-        // other owner can append output between the read and the decision.
-        if self.shutting_down.load(Ordering::SeqCst)
-            || !self
-                .store
-                .claim_stdout_owner(execution_id, &self.stdout_owner_id, STDOUT_OWNER_LEASE)
-                .await?
-        {
-            return Ok(false);
-        }
-        if self
-            .store
-            .execution_event_exists(execution_id, SESSION_OUTPUT_LINE_EVENT)
-            .await?
-            || self
-                .store
-                .execution_event_exists(execution_id, SESSION_EXECUTION_EVICTED_RETRY_EVENT)
-                .await?
-        {
-            return Ok(false);
-        }
-        let input = match self.load_persisted_execute_request(execution_id).await {
-            Ok(input) => input,
-            Err(error) => {
-                warn!(
-                    component = COMPONENT_SESSION_RUNTIME,
-                    event = "session_execution_evicted_retry_skipped",
-                    thread_key = %thread_key,
-                    execution_id,
-                    sandbox_id,
-                    %error,
-                    "evicted execution has no replayable request"
-                );
-                return Ok(false);
-            }
-        };
-        // Detach the dead sandbox so the replay creates a fresh one instead of
-        // trying to resume the evicted pod.
-        self.sandbox_pipes.remove(sandbox_id);
-        match self
-            .sandbox_runtime
-            .manager
-            .stop(&SandboxId::new(sandbox_id))
-            .await
-        {
-            Ok(()) | Err(SandboxError::NotFound(_)) => {}
-            Err(error) => return Err(SessionRuntimeError::Sandbox(error)),
-        }
-        self.store.update_sandbox_id(thread_key, None).await?;
-        // The once-only marker lands before the row becomes claimable again, so
-        // a crash between the two leaves a guarded row, never a replayable one.
-        // The requeue releases our stdout lease in the same statement and is a
-        // no-op if another control plane owns the execution, in which case the
-        // caller fails it as before.
-        self.store
-            .append_event(
-                thread_key,
-                Some(execution_id),
-                SESSION_EXECUTION_EVICTED_RETRY_EVENT,
-                json!({
-                    "execution_id": execution_id,
-                    "thread_key": thread_key.as_str(),
-                    "sandbox_id": sandbox_id,
-                }),
-            )
-            .await?;
-        if self
-            .store
-            .requeue_execution_if_running_and_stdout_owner(execution_id, &self.stdout_owner_id)
-            .await?
-            .is_none()
-        {
-            return Ok(false);
-        }
-        if let Some(span) = self.execution_spans.lock().await.remove(execution_id) {
-            finish_execution_trace_span(&span, "evicted");
-        }
-        let runtime = self.clone();
-        let thread_key = thread_key.clone();
-        let execution_id = execution_id.to_owned();
-        let old_sandbox_id = sandbox_id.to_owned();
-        tokio::spawn(async move {
-            match runtime
-                .execute_session_impl(&thread_key, input, Some(&execution_id), None)
-                .await
-            {
-                Ok(attempt) => info!(
-                    component = COMPONENT_SESSION_RUNTIME,
-                    event = "session_execution_evicted_retry",
-                    thread_key = %thread_key,
-                    execution_id,
-                    old_sandbox_id,
-                    new_sandbox_id = attempt.sandbox_id.as_deref().unwrap_or(""),
-                    "replayed evicted execution on a new sandbox"
-                ),
-                Err(error) => warn!(
-                    component = COMPONENT_SESSION_RUNTIME,
-                    event = "session_execution_evicted_retry_failed",
-                    thread_key = %thread_key,
-                    execution_id,
-                    old_sandbox_id,
-                    error = %error.into_source(),
-                    "failed to replay evicted execution"
-                ),
-            }
-        });
-        Ok(true)
     }
 
     async fn load_persisted_execute_request(
@@ -3525,7 +3450,11 @@ impl SessionRuntime {
     ) -> Option<String> {
         match self
             .iron_control
-            .register_requester(thread_key.as_str(), metadata)
+            .register_requester(
+                thread_key.as_str(),
+                metadata,
+                self.session_principal_admission.create_if_missing(),
+            )
             .await
         {
             Ok(principal) => principal.map(|principal| principal.id),
@@ -3725,7 +3654,6 @@ impl SessionRuntime {
             let stderr_key = pump_key.clone();
 
             spawn_stdout_pump_loop(StdoutPumpLoop {
-                runtime: self.clone(),
                 ctx,
                 open_lock,
                 thread_key: pump_thread_key,
@@ -4812,8 +4740,6 @@ enum StdoutPumpEnd {
 }
 
 struct StdoutPumpLoop {
-    /// Handle used to replay an execution whose sandbox was evicted mid-turn.
-    runtime: SessionRuntime,
     ctx: RuntimeContext,
     open_lock: Arc<Mutex<()>>,
     thread_key: ThreadKey,
@@ -4835,9 +4761,8 @@ enum ReattachOutcome {
     Retryable(String),
     /// The sandbox cannot serve IO anymore.
     Dead(String),
-    /// The sandbox disappeared for an infrastructure reason (the pod is Gone or
-    /// no longer exists) rather than an agent error, so the turn may be
-    /// replayable on a fresh sandbox.
+    /// The sandbox disappeared for an infrastructure reason rather than an
+    /// agent error.
     Evicted(String),
 }
 
@@ -4873,7 +4798,6 @@ fn remove_pipe_if_current(sandbox_pipes: &SessionPipeMap, sandbox_id: &str, pipe
 fn spawn_stdout_pump_loop(state: StdoutPumpLoop) {
     tokio::spawn(async move {
         let StdoutPumpLoop {
-            runtime,
             ctx,
             open_lock,
             thread_key,
@@ -5025,15 +4949,23 @@ fn spawn_stdout_pump_loop(state: StdoutPumpLoop) {
                         break 'pump;
                     }
                     ReattachOutcome::Evicted(detail) => {
-                        runtime
-                            .handle_evicted_execution(
-                                &ctx,
-                                &thread_key,
-                                &sandbox_id,
-                                &execution.execution_id,
-                                &detail,
-                            )
-                            .await;
+                        warn!(
+                            component = COMPONENT_SESSION_RUNTIME,
+                            event = "session_execution_sandbox_evicted",
+                            thread_key = %thread_key,
+                            execution_id = %execution.execution_id,
+                            sandbox_id = %sandbox_id,
+                            detail,
+                            "sandbox replaced before the turn finished"
+                        );
+                        fail_detached_execution_with(
+                            &ctx,
+                            &thread_key,
+                            &sandbox_id,
+                            &execution.execution_id,
+                            SANDBOX_EVICTED_REQUESTER_MESSAGE.to_owned(),
+                        )
+                        .await;
                         break 'pump;
                     }
                 }
@@ -5068,12 +5000,8 @@ async fn reattach_session_pipe(
             Ok(observed)
                 if pipe.instance_id.is_some() && observed.instance_id != pipe.instance_id =>
             {
-                // The pod we streamed from is gone (no pod UID) or replaced by a
-                // new pod UID while the execution is still live: the eviction /
-                // node-replacement shape, not an agent error. Classify as
-                // Evicted so the turn replays once when no output has persisted.
-                // A genuine agent error keeps the same pod UID and reaches the
-                // Dead arms below.
+                // The pod we streamed from was replaced, rather than stopped by
+                // an agent error. Surface the infrastructure-specific message.
                 return ReattachOutcome::Evicted(format!(
                     "sandbox instance changed while reattaching stdout (status {:?})",
                     observed.status
@@ -5085,7 +5013,7 @@ async fn reattach_session_pipe(
                         let parts = io.into_parts();
                         if pipe.instance_id.is_some() && parts.instance_id != pipe.instance_id {
                             // Replaced between observe and open: same eviction
-                            // shape, so replay rather than fail.
+                            // shape and requester-facing failure.
                             return ReattachOutcome::Evicted(
                                 "sandbox instance changed while opening stdout".to_owned(),
                             );
@@ -5148,10 +5076,11 @@ async fn reattach_session_pipe(
             }
             Ok(observed) => {
                 let detail = sandbox_dead_detail(&observed.status, observed.reason.as_deref());
-                // A `Gone` pod is an infrastructure disappearance (eviction,
-                // node replacement), not an agent error, so the turn may be
-                // replayable. Every other terminal status is a real death.
-                if observed.status == SandboxStatus::Gone {
+                // Kubernetes reports an evicted pod as Stopped with reason
+                // Evicted before deletion, then Gone or NotFound afterward.
+                if observed.status == SandboxStatus::Gone
+                    || observed.reason.as_deref() == Some("Evicted")
+                {
                     return ReattachOutcome::Evicted(detail);
                 }
                 return ReattachOutcome::Dead(detail);
@@ -6482,7 +6411,7 @@ fn terminal_failure_class(error: &str) -> &'static str {
     if error.contains("oomkilled") {
         return "oom";
     }
-    if error.contains("evicted") {
+    if error.contains("evicted") || error.contains("sandbox running this response was replaced") {
         return "evicted";
     }
     if error.contains("max_duration") || error.contains("timeout") || error.contains("timed out") {
@@ -8497,6 +8426,10 @@ mod tests {
             )),
             "evicted"
         );
+        assert_eq!(
+            terminal_failure_class(SANDBOX_EVICTED_REQUESTER_MESSAGE),
+            "evicted"
+        );
         // Without a reason the classification is unchanged.
         assert_eq!(
             terminal_failure_class(&format!(
@@ -9406,12 +9339,49 @@ mod adoption_tests {
     #[derive(Clone, Copy)]
     struct TestSessionPrincipalRegistrar;
 
+    #[derive(Clone, Copy)]
+    struct AdmissionProbeRegistrar;
+
+    #[async_trait::async_trait]
+    impl SessionPrincipalRegistrar for AdmissionProbeRegistrar {
+        async fn register_session(
+            &self,
+            _thread_key: &str,
+            _metadata: Option<&Value>,
+            create_if_missing: bool,
+        ) -> Result<Principal, IronControlError> {
+            if create_if_missing {
+                Err(IronControlError::PrincipalDerivation(
+                    centaur_iron_control::PrincipalDerivationError::MissingSlackTeamId,
+                ))
+            } else {
+                Err(IronControlError::SessionPrincipalNotPreapproved {
+                    foreign_id: "slack-channel-t123-c123".to_owned(),
+                })
+            }
+        }
+
+        async fn register_requester(
+            &self,
+            _thread_key: &str,
+            _metadata: Option<&Value>,
+            _create_if_missing: bool,
+        ) -> Result<Option<Principal>, IronControlError> {
+            Ok(None)
+        }
+
+        async fn get_principal(&self, principal: &str) -> Result<Principal, IronControlError> {
+            Ok(test_principal(principal))
+        }
+    }
+
     #[async_trait::async_trait]
     impl SessionPrincipalRegistrar for TestSessionPrincipalRegistrar {
         async fn register_session(
             &self,
             _thread_key: &str,
             _metadata: Option<&Value>,
+            _create_if_missing: bool,
         ) -> Result<Principal, IronControlError> {
             Ok(test_principal("prn_test"))
         }
@@ -9420,6 +9390,7 @@ mod adoption_tests {
             &self,
             _thread_key: &str,
             _metadata: Option<&Value>,
+            _create_if_missing: bool,
         ) -> Result<Option<Principal>, IronControlError> {
             Ok(None)
         }
@@ -9437,6 +9408,72 @@ mod adoption_tests {
             labels: BTreeMap::new(),
             sandbox_observability_enabled: true,
         }
+    }
+
+    #[tokio::test]
+    async fn preapproved_admission_disables_principal_creation_before_store_access() {
+        let pool =
+            sqlx::PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test")
+                .expect("create lazy pool");
+        let runtime = SessionRuntime::new(
+            PgSessionStore::new(pool),
+            SandboxRuntime::backend(
+                Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+                SandboxSpec::new("test"),
+            ),
+            AdmissionProbeRegistrar,
+        )
+        .with_session_principal_admission(SessionPrincipalAdmission::Preapproved);
+
+        let error = runtime
+            .create_or_get_admitted_session(
+                &ThreadKey::try_from("slack:T123:C123:1773364194.179929".to_owned()).unwrap(),
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionRuntimeError::IronControl(
+                IronControlError::SessionPrincipalNotPreapproved { .. }
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn internal_sessions_keep_automatic_principal_creation() {
+        let pool =
+            sqlx::PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test")
+                .expect("create lazy pool");
+        let runtime = SessionRuntime::new(
+            PgSessionStore::new(pool),
+            SandboxRuntime::backend(
+                Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+                SandboxSpec::new("test"),
+            ),
+            AdmissionProbeRegistrar,
+        )
+        .with_session_principal_admission(SessionPrincipalAdmission::Preapproved);
+
+        let error = runtime
+            .create_or_get_session(
+                &ThreadKey::try_from("workflow:internal:test".to_owned()).unwrap(),
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionRuntimeError::IronControl(IronControlError::PrincipalDerivation(_))
+        ));
     }
 
     type ProxyEnsure = (String, String, Option<String>, BTreeMap<String, String>);
@@ -11556,28 +11593,18 @@ mod adoption_tests {
         reset_test_store(&store).await;
     }
 
-    /// A node replacement evicted the sandbox after the harness had produced
-    /// output (a tool call, an answer delta). The turn cannot be replayed
-    /// without repeating side effects, so it fails with a requester-facing
-    /// message instead of the raw pump error, and it is not replayed.
+    /// Kubernetes reports an evicted pod as Stopped before deleting it. Fail
+    /// with a requester-facing message even when no output was persisted;
+    /// replaying could repeat an unrecorded external side effect.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn evicted_sandbox_after_output_fails_with_requester_message() {
+    async fn evicted_sandbox_before_deletion_fails_with_requester_message() {
         let Some(store) = test_store().await else {
             return;
         };
         let _serial = TEST_LOCK.lock().await;
         let thread_key =
-            ThreadKey::parse(format!("test:evicted-late-{}", uuid::Uuid::new_v4())).unwrap();
-        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-gone"), true).await;
-        store
-            .append_event(
-                &thread_key,
-                Some(&execution_id),
-                SESSION_OUTPUT_LINE_EVENT,
-                json!({"line": "{\"type\":\"item.started\",\"item\":{\"type\":\"mcpToolCall\"}}"}),
-            )
-            .await
-            .expect("persisted output line");
+            ThreadKey::parse(format!("test:evicted-early-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-evicted"), true).await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let (io, stdout, _stdin) = mock_io();
@@ -11586,10 +11613,11 @@ mod adoption_tests {
         let runtime = runtime_with(&store, backend.clone());
         claim_test_stdout_owner(&runtime, &execution_id).await;
         runtime
-            .ensure_session_pipe(&thread_key, "sbx-gone")
+            .ensure_session_pipe(&thread_key, "sbx-evicted")
             .await
             .expect("open initial pipe");
-        backend.set_status(SandboxStatus::Gone);
+        backend.set_reason(Some("Evicted"));
+        backend.set_status(SandboxStatus::Stopped);
         drop(stdout);
 
         wait_for_event(&store, &thread_key, "session.execution_failed").await;
@@ -11601,11 +11629,6 @@ mod adoption_tests {
         assert_eq!(
             failed.payload["error"].as_str(),
             Some(SANDBOX_EVICTED_REQUESTER_MESSAGE)
-        );
-        assert!(
-            !all.iter()
-                .any(|event| event.event_type == SESSION_EXECUTION_EVICTED_RETRY_EVENT),
-            "an execution with persisted output must not be replayed"
         );
         let execution = store
             .latest_execution_for_thread(&thread_key)
@@ -11620,65 +11643,6 @@ mod adoption_tests {
         );
         assert_eq!(backend.opens(), 1);
         assert!(backend.created_specs().is_empty());
-        reset_test_store(&store).await;
-    }
-
-    /// A node replacement evicted the sandbox before the harness produced any
-    /// output. The persisted request is replayed once on a fresh sandbox, and
-    /// the durable once-only marker is written exactly once so a second loss
-    /// cannot replay again.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn evicted_sandbox_before_output_is_replayed_once() {
-        use tokio::io::AsyncReadExt;
-        let Some(store) = test_store().await else {
-            return;
-        };
-        let _serial = TEST_LOCK.lock().await;
-        let thread_key =
-            ThreadKey::parse(format!("test:evicted-early-{}", uuid::Uuid::new_v4())).unwrap();
-        // Queued rows carry the persisted request; mark it running like the live
-        // dispatch does.
-        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-gone"), false).await;
-        store
-            .mark_execution_running(&execution_id)
-            .await
-            .expect("mark running");
-
-        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
-        let (io, stdout, _stdin) = mock_io();
-        backend.push_io(io).await;
-        let (replay_io, _replay_stdout, mut replay_stdin) = mock_io();
-        backend.push_io(replay_io).await;
-
-        let runtime = runtime_with(&store, backend.clone());
-        claim_test_stdout_owner(&runtime, &execution_id).await;
-        runtime
-            .ensure_session_pipe(&thread_key, "sbx-gone")
-            .await
-            .expect("open initial pipe");
-        backend.set_status(SandboxStatus::Gone);
-        drop(stdout);
-
-        wait_for_event(&store, &thread_key, SESSION_EXECUTION_EVICTED_RETRY_EVENT).await;
-        // The persisted input reaches the new sandbox's stdin.
-        let mut replayed = vec![0_u8; 4096];
-        let read = tokio::time::timeout(Duration::from_secs(5), replay_stdin.read(&mut replayed))
-            .await
-            .expect("replayed input within timeout")
-            .expect("read replayed input");
-        assert!(
-            String::from_utf8_lossy(&replayed[..read]).contains("recover me"),
-            "expected the persisted request to be replayed"
-        );
-        let session = store.get_session(&thread_key).await.unwrap();
-        assert_eq!(session.sandbox_id.as_deref(), Some("mock-sbx"));
-        assert_eq!(backend.created_specs().len(), 1, "replayed exactly once");
-        let retry_events = events(&store, &thread_key)
-            .await
-            .into_iter()
-            .filter(|event| event.event_type == SESSION_EXECUTION_EVICTED_RETRY_EVENT)
-            .count();
-        assert_eq!(retry_events, 1, "the once-only marker must be written once");
         reset_test_store(&store).await;
     }
 
@@ -11733,6 +11697,87 @@ mod adoption_tests {
             Some("Completed after reattach.")
         );
         assert_eq!(backend.opens(), 2);
+        reset_test_store(&store).await;
+    }
+
+    /// A drain issued during a rollout must not kill a sandbox whose session
+    /// still has an in-flight turn, unless the caller forces it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_skips_busy_sandbox_unless_forced() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:drain-busy-{}", uuid::Uuid::new_v4())).unwrap();
+        // A session that owns a sandbox and has a running execution is "busy".
+        let _execution_id = orphaned_execution(&store, &thread_key, Some("sbx-busy"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        backend.set_observed_status("sbx-busy", SandboxStatus::Running);
+        let runtime = runtime_with(&store, backend.clone());
+
+        // An unforced drain leaves the busy sandbox running and reports it.
+        let report = runtime.drain(false).await.expect("drain");
+        assert_eq!(report.busy, vec!["sbx-busy".to_owned()]);
+        assert!(
+            report.stopped.is_empty(),
+            "busy sandbox must not be stopped"
+        );
+        assert!(backend.stopped().is_empty());
+
+        // A forced drain stops it regardless of the active execution.
+        let report = runtime.drain(true).await.expect("force drain");
+        assert!(report.busy.is_empty());
+        assert_eq!(report.stopped, vec!["sbx-busy".to_owned()]);
+        assert_eq!(backend.stopped(), vec!["sbx-busy".to_owned()]);
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unforced_drain_only_stops_sandboxes_proven_idle() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let idle_thread =
+            ThreadKey::parse(format!("test:drain-idle-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &idle_thread,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create idle session");
+        store
+            .update_sandbox_id(&idle_thread, Some("sbx-idle"))
+            .await
+            .expect("assign idle sandbox");
+        store
+            .insert_ready_warm_sandbox("sbx-warm", "test-workload")
+            .await
+            .expect("insert ready warm sandbox");
+
+        let provisioning_thread =
+            ThreadKey::parse(format!("test:drain-provisioning-{}", uuid::Uuid::new_v4())).unwrap();
+        let _execution_id = orphaned_execution(&store, &provisioning_thread, None, true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        for sandbox_id in ["sbx-idle", "sbx-warm", "sbx-provisioning"] {
+            backend.set_observed_status(sandbox_id, SandboxStatus::Running);
+        }
+        let runtime = runtime_with(&store, backend.clone());
+
+        let report = runtime.drain(false).await.expect("drain");
+        assert_eq!(report.stopped.len(), 2);
+        assert!(report.stopped.contains(&"sbx-idle".to_owned()));
+        assert!(report.stopped.contains(&"sbx-warm".to_owned()));
+        assert_eq!(report.busy, vec!["sbx-provisioning".to_owned()]);
+        assert_eq!(backend.stopped().len(), 2);
+        assert!(!backend.stopped().contains(&"sbx-provisioning".to_owned()));
         reset_test_store(&store).await;
     }
 
@@ -11855,9 +11900,8 @@ mod adoption_tests {
             .iter()
             .find(|event| event.event_type == "session.execution_failed")
             .expect("failed event");
-        // A replaced pod is the eviction shape; with no replayable request the
-        // turn fails with the requester-facing eviction message instead of
-        // inheriting the active execution onto the new pod.
+        // A replaced pod is an infrastructure failure, so do not inherit the
+        // active execution onto it or expose the raw pump detail.
         assert!(
             failed.payload["error"]
                 .as_str()
@@ -11869,66 +11913,6 @@ mod adoption_tests {
                 .any(|event| event.event_type == "session.stdout_pump_reattached"),
             "must not reattach the pump to the replacement pod"
         );
-        reset_test_store(&store).await;
-    }
-
-    /// A node replacement deletes the pod we streamed from, so the retained
-    /// Sandbox observes a new pod UID (the instance-mismatch entry, not a
-    /// synthetic Gone). With a persisted request and no output yet, the turn
-    /// must replay exactly once rather than fail as a detached pump.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn evicted_replaced_instance_is_replayed_once() {
-        use tokio::io::AsyncReadExt;
-        let Some(store) = test_store().await else {
-            return;
-        };
-        let _serial = TEST_LOCK.lock().await;
-        let thread_key =
-            ThreadKey::parse(format!("test:evicted-replaced-{}", uuid::Uuid::new_v4())).unwrap();
-        let execution_id =
-            orphaned_execution(&store, &thread_key, Some("sbx-replaced"), false).await;
-        store
-            .mark_execution_running(&execution_id)
-            .await
-            .expect("mark running");
-
-        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
-        let (io, stdout, _stdin) = mock_io();
-        backend.push_io(io).await;
-        let (replay_io, _replay_stdout, mut replay_stdin) = mock_io();
-        backend.push_io(replay_io).await;
-
-        let runtime = runtime_with(&store, backend.clone());
-        claim_test_stdout_owner(&runtime, &execution_id).await;
-        runtime
-            .ensure_session_pipe(&thread_key, "sbx-replaced")
-            .await
-            .expect("open initial pipe");
-
-        // Real eviction entry: the pod we streamed from is replaced by a new
-        // pod UID, so observe() reports a different instance than the pipe.
-        backend.set_status(SandboxStatus::Created);
-        drop(stdout);
-        backend.created_observed.notified().await;
-        backend.set_instance_id("replacement-instance");
-        backend.set_status(SandboxStatus::Running);
-
-        wait_for_event(&store, &thread_key, SESSION_EXECUTION_EVICTED_RETRY_EVENT).await;
-        let mut replayed = vec![0_u8; 4096];
-        let read = tokio::time::timeout(Duration::from_secs(5), replay_stdin.read(&mut replayed))
-            .await
-            .expect("replayed input within timeout")
-            .expect("read replayed input");
-        assert!(
-            String::from_utf8_lossy(&replayed[..read]).contains("recover me"),
-            "expected the persisted request to be replayed"
-        );
-        let retry_events = events(&store, &thread_key)
-            .await
-            .into_iter()
-            .filter(|event| event.event_type == SESSION_EXECUTION_EVICTED_RETRY_EVENT)
-            .count();
-        assert_eq!(retry_events, 1, "an instance-mismatch eviction replays exactly once");
         reset_test_store(&store).await;
     }
 
@@ -12024,8 +12008,7 @@ mod adoption_tests {
             .await
             .expect("open initial pipe");
         // A non-eviction terminal status (a crashed/stopped pod, same pod UID)
-        // still fails with the raw pump error; only Gone / instance-mismatch
-        // evictions replay.
+        // still fails with the raw pump error.
         backend.set_status(SandboxStatus::Stopped);
         drop(stdout);
 
