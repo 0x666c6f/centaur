@@ -838,8 +838,8 @@ async fn interrupt_session_execution(
 
 #[derive(Debug, Default, serde::Deserialize)]
 struct DrainQuery {
-    /// When true, stop every non-terminal sandbox even if it has an active
-    /// execution. Defaults to false, which leaves busy sandboxes running.
+    /// When true, stop every non-terminal sandbox. Defaults to false, which
+    /// stops only sandboxes durably known to be idle.
     #[serde(default)]
     force: bool,
 }

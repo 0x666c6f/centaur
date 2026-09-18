@@ -634,24 +634,40 @@ impl PgSessionStore {
         row.try_into().map(Some)
     }
 
-    /// Sandboxes whose session still has a queued or running execution. Used
-    /// by a busy-aware drain so a rollout can leave in-flight turns running.
-    pub async fn busy_sandbox_ids(&self) -> Result<Vec<String>, SessionStoreError> {
-        let rows = sqlx::query_scalar::<_, String>(
+    /// Returns whether a sandbox is durably known to be idle and safe for an
+    /// unforced drain. Unknown and partially assigned sandboxes fail closed.
+    pub async fn sandbox_is_idle_for_drain(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<bool, SessionStoreError> {
+        let idle = sqlx::query_scalar::<_, bool>(
             r#"
-            select distinct sessions.sandbox_id
-            from sessions
-            join session_executions on session_executions.thread_key = sessions.thread_key
-            where sessions.sandbox_id is not null
-              and session_executions.status in ($1, $2)
+            select exists (
+                select 1
+                from sessions
+                where sessions.sandbox_id = $1
+                  and not exists (
+                      select 1
+                      from session_executions
+                      where session_executions.thread_key = sessions.thread_key
+                        and session_executions.status in ($2, $3)
+                  )
+
+                union all
+
+                select 1
+                from session_warm_sandboxes
+                where sandbox_id = $1 and status = 'ready'
+            )
             "#,
         )
+        .bind(sandbox_id)
         .bind(ExecutionStatus::Queued.as_ref())
         .bind(ExecutionStatus::Running.as_ref())
-        .fetch_all(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
 
-        Ok(rows)
+        Ok(idle)
     }
 
     pub async fn claim_stdout_owner(
